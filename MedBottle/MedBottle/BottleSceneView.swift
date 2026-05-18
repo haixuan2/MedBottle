@@ -147,6 +147,7 @@ enum BottleSceneFactory {
         static let tablets = "tablets"
         static let pill = "pill"
         static let pillRemoving = "pillRemoving"
+        static let shadowPlane = "shadowPlane"
         static let collisionFloor = "collisionFloor"
         static let collisionWalls = "collisionWalls"
         static let keyLight = "keyLight"
@@ -225,18 +226,17 @@ enum BottleSceneFactory {
 
     private struct LightingProfile {
         let key: CGFloat
-        let fill: CGFloat
-        let ambient: CGFloat
+        let environment: CGFloat
         let exposure: CGFloat
         let contrast: CGFloat
         let saturation: CGFloat
 
         static func profile(for colorScheme: ColorScheme) -> LightingProfile {
             if colorScheme == .dark {
-                return LightingProfile(key: 285, fill: 72, ambient: 62, exposure: -0.62, contrast: 0.04, saturation: 0.86)
+                return LightingProfile(key: 420, environment: 1.25, exposure: -0.70, contrast: 0.08, saturation: 0.90)
             }
 
-            return LightingProfile(key: 340, fill: 92, ambient: 96, exposure: -0.48, contrast: 0.04, saturation: 0.88)
+            return LightingProfile(key: 520, environment: 1.45, exposure: -0.56, contrast: 0.08, saturation: 0.92)
         }
     }
 
@@ -246,10 +246,10 @@ enum BottleSceneFactory {
         let lighting = LightingProfile.profile(for: colorScheme)
         let scene = SCNScene()
         scene.physicsWorld.gravity = SCNVector3(0, -9.8, 0)
+        applyLightingEnvironment(to: scene, colorScheme: colorScheme)
         scene.rootNode.addChildNode(cameraNode(lighting: lighting))
-        scene.rootNode.addChildNode(lightNode(name: NodeName.keyLight, type: .omni, position: SCNVector3(-2.4, 4.4, 4.8), intensity: lighting.key))
-        scene.rootNode.addChildNode(lightNode(name: NodeName.fillLight, type: .omni, position: SCNVector3(2.2, 2.0, -2.8), intensity: lighting.fill))
-        scene.rootNode.addChildNode(lightNode(name: NodeName.ambientLight, type: .ambient, position: SCNVector3Zero, intensity: lighting.ambient))
+        scene.rootNode.addChildNode(keyLightNode(intensity: lighting.key))
+        scene.rootNode.addChildNode(shadowPlaneNode(colorScheme: colorScheme))
 
         let assembly = SCNNode()
         assembly.name = NodeName.assembly
@@ -379,9 +379,19 @@ enum BottleSceneFactory {
 
     private static func updateLighting(in scene: SCNScene, colorScheme: ColorScheme) {
         let lighting = LightingProfile.profile(for: colorScheme)
-        scene.rootNode.childNode(withName: NodeName.keyLight, recursively: false)?.light?.intensity = lighting.key
-        scene.rootNode.childNode(withName: NodeName.fillLight, recursively: false)?.light?.intensity = lighting.fill
-        scene.rootNode.childNode(withName: NodeName.ambientLight, recursively: false)?.light?.intensity = lighting.ambient
+        applyLightingEnvironment(to: scene, colorScheme: colorScheme)
+        if let keyLight = scene.rootNode.childNode(withName: NodeName.keyLight, recursively: false) {
+            configureKeyLight(keyLight, intensity: lighting.key)
+        } else {
+            scene.rootNode.addChildNode(keyLightNode(intensity: lighting.key))
+        }
+        scene.rootNode.childNode(withName: NodeName.fillLight, recursively: false)?.removeFromParentNode()
+        scene.rootNode.childNode(withName: NodeName.ambientLight, recursively: false)?.removeFromParentNode()
+        if let shadowPlane = scene.rootNode.childNode(withName: NodeName.shadowPlane, recursively: false) {
+            shadowPlane.geometry?.firstMaterial = shadowPlaneMaterial(colorScheme: colorScheme)
+        } else {
+            scene.rootNode.addChildNode(shadowPlaneNode(colorScheme: colorScheme))
+        }
 
         if let camera = scene.rootNode.childNodes.compactMap(\.camera).first {
             camera.exposureOffset = lighting.exposure
@@ -390,11 +400,19 @@ enum BottleSceneFactory {
         }
     }
 
+    private static func applyLightingEnvironment(to scene: SCNScene, colorScheme: ColorScheme) {
+        let lighting = LightingProfile.profile(for: colorScheme)
+        if let environmentURL = Bundle.main.url(forResource: "studio_lighting", withExtension: "hdr") {
+            scene.lightingEnvironment.contents = environmentURL
+        }
+        scene.lightingEnvironment.intensity = lighting.environment
+    }
+
     private static func cameraNode(lighting: LightingProfile) -> SCNNode {
         let camera = SCNCamera()
         camera.usesOrthographicProjection = false
         camera.fieldOfView = 31.5
-        camera.wantsHDR = false
+        camera.wantsHDR = true
         camera.wantsExposureAdaptation = false
         camera.exposureOffset = lighting.exposure
         camera.contrast = lighting.contrast
@@ -409,16 +427,56 @@ enum BottleSceneFactory {
         return node
     }
 
-    private static func lightNode(name: String, type: SCNLight.LightType, position: SCNVector3, intensity: CGFloat) -> SCNNode {
+    private static func keyLightNode(intensity: CGFloat) -> SCNNode {
         let light = SCNLight()
-        light.type = type
-        light.intensity = intensity
 
         let node = SCNNode()
-        node.name = name
+        node.name = NodeName.keyLight
         node.light = light
-        node.position = position
+        configureKeyLight(node, intensity: intensity)
         return node
+    }
+
+    private static func configureKeyLight(_ node: SCNNode, intensity: CGFloat) {
+        let light = node.light ?? SCNLight()
+        light.type = .directional
+        light.intensity = intensity
+        light.castsShadow = true
+        light.shadowMode = .deferred
+        light.shadowSampleCount = 24
+        light.shadowRadius = 4
+        light.shadowBias = 0.002
+        light.shadowColor = UIColor.black.withAlphaComponent(0.34)
+
+        node.light = light
+        node.position = SCNVector3(-2.6, 4.6, 4.0)
+        node.look(at: SCNVector3(0, -0.3, 0))
+    }
+
+    private static func shadowPlaneNode(colorScheme: ColorScheme) -> SCNNode {
+        let plane = SCNPlane(width: 3.0, height: 1.8)
+        plane.materials = [shadowPlaneMaterial(colorScheme: colorScheme)]
+
+        let node = SCNNode(geometry: plane)
+        node.name = NodeName.shadowPlane
+        node.position = SCNVector3(0, -1.96, 0.10)
+        node.eulerAngles.x = -Float.pi / 2
+        node.castsShadow = false
+        return node
+    }
+
+    private static func shadowPlaneMaterial(colorScheme: ColorScheme) -> SCNMaterial {
+        let material = SCNMaterial()
+        material.diffuse.contents = UIColor.white
+        material.roughness.contents = 0.92
+        material.metalness.contents = 0.0
+        material.lightingModel = .physicallyBased
+        material.colorBufferWriteMask = []
+        material.blendMode = .replace
+        material.transparency = 1.0
+        material.writesToDepthBuffer = false
+        material.readsFromDepthBuffer = true
+        return material
     }
 
     private static func bottleNode(color: UIColor, colorScheme: ColorScheme) -> SCNNode {
@@ -434,7 +492,7 @@ enum BottleSceneFactory {
         bodyNode.position = SCNVector3(0, -0.04, 0)
         bodyNode.eulerAngles.y = Float.pi
         bodyNode.renderingOrder = RenderOrder.bottleShell
-        bodyNode.castsShadow = false
+        bodyNode.castsShadow = true
         node.addChildNode(bodyNode)
 
         let topBand = SCNTube(innerRadius: 0.68, outerRadius: 0.79, height: 0.34)
@@ -444,7 +502,7 @@ enum BottleSceneFactory {
         topBandNode.position = SCNVector3(0, 1.20, 0)
         topBandNode.eulerAngles.y = Float.pi
         topBandNode.renderingOrder = RenderOrder.bottleShell
-        topBandNode.castsShadow = false
+        topBandNode.castsShadow = true
         node.addChildNode(topBandNode)
 
         let bottomRim = SCNTorus(ringRadius: 0.70, pipeRadius: 0.045)
@@ -454,7 +512,7 @@ enum BottleSceneFactory {
         bottomRimNode.name = NodeName.bottomRim
         bottomRimNode.position = SCNVector3(0, -1.46, 0)
         bottomRimNode.renderingOrder = RenderOrder.bottleShell
-        bottomRimNode.castsShadow = false
+        bottomRimNode.castsShadow = true
         node.addChildNode(bottomRimNode)
 
         applyBottleColor(to: node, color: color, colorScheme: colorScheme)
@@ -489,19 +547,18 @@ enum BottleSceneFactory {
         let material = SCNMaterial()
         let balancedColor = blend(color, with: .black, ratio: colorScheme == .dark ? 0.34 : 0.22)
         material.diffuse.contents = balancedColor.withAlphaComponent(alpha)
-        material.ambient.contents = blend(balancedColor, with: .black, ratio: 0.26).withAlphaComponent(alpha)
-        material.specular.contents = UIColor.white.withAlphaComponent(colorScheme == .dark ? 0.07 : 0.10)
+        material.specular.contents = UIColor.white.withAlphaComponent(colorScheme == .dark ? 0.20 : 0.24)
         material.emission.contents = UIColor.clear
-        material.shininess = 0.14
-        material.transparency = colorScheme == .dark ? 0.62 : 0.66
-        material.roughness.contents = 0.78
-        material.metalness.contents = 0
+        material.transparency = alpha
+        material.roughness.contents = 0.2
+        material.metalness.contents = 0.0
         material.blendMode = .alpha
-        material.transparencyMode = .singleLayer
+        material.transparencyMode = .dualLayer
         material.cullMode = .back
         material.readsFromDepthBuffer = true
         material.writesToDepthBuffer = true
         material.lightingModel = .physicallyBased
+        material.fresnelExponent = 1.35
         return material
     }
 
@@ -523,7 +580,8 @@ enum BottleSceneFactory {
 
     private static func capNode(colorScheme: ColorScheme) -> SCNNode {
         let cap = SCNCylinder(radius: 0.92, height: 0.48)
-        cap.radialSegmentCount = 96
+        cap.radialSegmentCount = 128
+        cap.heightSegmentCount = 4
 
         let material = capMaterial(colorScheme: colorScheme)
         cap.materials = [material]
@@ -531,35 +589,36 @@ enum BottleSceneFactory {
         let node = SCNNode(geometry: cap)
         node.position = SCNVector3(0, 1.58, 0)
         node.renderingOrder = RenderOrder.cap
-        node.castsShadow = false
+        node.castsShadow = true
 
         let underside = SCNCylinder(radius: 0.72, height: 0.018)
-        underside.radialSegmentCount = 96
+        underside.radialSegmentCount = 128
         underside.materials = [capUndersideMaterial(colorScheme: colorScheme)]
         let undersideNode = SCNNode(geometry: underside)
         undersideNode.position = SCNVector3(0, -0.262, 0)
         undersideNode.renderingOrder = RenderOrder.cap
-        undersideNode.castsShadow = false
+        undersideNode.castsShadow = true
         node.addChildNode(undersideNode)
 
         let skirt = SCNCylinder(radius: 0.94, height: 0.22)
-        skirt.radialSegmentCount = 96
+        skirt.radialSegmentCount = 128
+        skirt.heightSegmentCount = 3
         skirt.materials = [material]
         let skirtNode = SCNNode(geometry: skirt)
         skirtNode.position = SCNVector3(0, -0.31, 0)
         skirtNode.renderingOrder = RenderOrder.cap
-        skirtNode.castsShadow = false
+        skirtNode.castsShadow = true
         node.addChildNode(skirtNode)
 
-        for index in 0..<20 {
+        for index in 0..<36 {
             let ridge = SCNBox(width: 0.026, height: 0.48, length: 0.075, chamferRadius: 0.01)
             ridge.materials = [material]
             let ridgeNode = SCNNode(geometry: ridge)
-            let angle = (Float(index) / 20) * Float.pi * 2
+            let angle = (Float(index) / 36) * Float.pi * 2
             ridgeNode.position = SCNVector3(cos(angle) * 0.94, 0, sin(angle) * 0.94)
             ridgeNode.eulerAngles.y = -angle
             ridgeNode.renderingOrder = RenderOrder.cap
-            ridgeNode.castsShadow = false
+            ridgeNode.castsShadow = true
             node.addChildNode(ridgeNode)
         }
 
@@ -582,13 +641,11 @@ enum BottleSceneFactory {
             ? UIColor(red: 0.50, green: 0.47, blue: 0.38, alpha: 1)
             : UIColor(red: 0.72, green: 0.68, blue: 0.56, alpha: 1)
         material.diffuse.contents = plastic
-        material.ambient.contents = blend(plastic, with: .black, ratio: 0.22)
-        material.specular.contents = UIColor.white.withAlphaComponent(0.10)
+        material.specular.contents = UIColor.white.withAlphaComponent(0.16)
         material.emission.contents = UIColor.clear
-        material.shininess = 0.12
-        material.roughness.contents = 0.82
-        material.metalness.contents = 0
-        material.lightingModel = .blinn
+        material.roughness.contents = 0.46
+        material.metalness.contents = 0.0
+        material.lightingModel = .physicallyBased
         return material
     }
 
@@ -598,12 +655,11 @@ enum BottleSceneFactory {
             ? UIColor(red: 0.38, green: 0.36, blue: 0.30, alpha: 1)
             : UIColor(red: 0.62, green: 0.58, blue: 0.48, alpha: 1)
         material.diffuse.contents = liner
-        material.ambient.contents = blend(liner, with: .black, ratio: 0.18)
         material.specular.contents = UIColor.white.withAlphaComponent(0.07)
         material.emission.contents = UIColor.clear
-        material.roughness.contents = 0.72
-        material.metalness.contents = 0
-        material.lightingModel = .blinn
+        material.roughness.contents = 0.58
+        material.metalness.contents = 0.0
+        material.lightingModel = .physicallyBased
         material.writesToDepthBuffer = true
         return material
     }
@@ -847,6 +903,7 @@ enum BottleSceneFactory {
         material.diffuse.contents = tabletColor(for: shape, index: index)
         material.specular.contents = UIColor.white.withAlphaComponent(0.22)
         material.roughness.contents = 0.62
+        material.metalness.contents = 0.0
         material.lightingModel = .physicallyBased
         tablet.materials = [material]
 
@@ -857,6 +914,7 @@ enum BottleSceneFactory {
         node.eulerAngles = pillSpawnRotation(shape: shape, index: index)
         node.physicsBody = pillPhysicsBody(for: tablet)
         node.physicsBody?.isAffectedByGravity = true
+        node.castsShadow = true
         return node
     }
 
@@ -949,20 +1007,22 @@ enum BottleSceneFactory {
     private static func tabletGeometry(for shape: MedicationShape) -> SCNGeometry {
         switch shape {
         case .tablet:
-            let cylinder = SCNCylinder(radius: 0.092, height: 0.07)
-            cylinder.radialSegmentCount = 48
+            let cylinder = SCNCylinder(radius: 0.118, height: 0.088)
+            cylinder.radialSegmentCount = 64
+            cylinder.heightSegmentCount = 3
             return cylinder
         case .pill:
-            let sphere = SCNSphere(radius: 0.09)
-            sphere.segmentCount = 32
+            let sphere = SCNSphere(radius: 0.116)
+            sphere.segmentCount = 48
             return sphere
         case .capsule:
-            let capsule = SCNCapsule(capRadius: 0.07, height: 0.28)
-            capsule.radialSegmentCount = 32
+            let capsule = SCNCapsule(capRadius: 0.09, height: 0.36)
+            capsule.radialSegmentCount = 48
+            capsule.heightSegmentCount = 12
             return capsule
         case .softgel:
-            let sphere = SCNSphere(radius: 0.1)
-            sphere.segmentCount = 32
+            let sphere = SCNSphere(radius: 0.128)
+            sphere.segmentCount = 48
             return sphere
         }
     }

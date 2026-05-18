@@ -21,6 +21,7 @@
 		8B3F3A412C20100100100001 /* MedicationDetailViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B3F3A402C20100100100001 /* MedicationDetailViewModel.swift */; };
 		8B3F3A502C20100100100001 /* MedicationDetailViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B3F3A532C20100100100001 /* MedicationDetailViewModelTests.swift */; };
 		8B3F3A612C20100100100001 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 8B3F3A602C20100100100001 /* Assets.xcassets */; };
+		8B3F3A642C20100100100001 /* studio_lighting.hdr in Resources */ = {isa = PBXBuildFile; fileRef = 8B3F3A632C20100100100001 /* studio_lighting.hdr */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -51,6 +52,7 @@
 		8B3F3A522C20100100100001 /* MedBottleTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = MedBottleTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		8B3F3A532C20100100100001 /* MedicationDetailViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MedicationDetailViewModelTests.swift; sourceTree = "<group>"; };
 		8B3F3A602C20100100100001 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		8B3F3A632C20100100100001 /* studio_lighting.hdr */ = {isa = PBXFileReference; lastKnownFileType = file; path = studio_lighting.hdr; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -105,9 +107,18 @@
 				8B3F3A3C2C20100100100001 /* NotificationManager.swift */,
 				8B3F3A272C20100100100001 /* DoseHistoryView.swift */,
 				8B3F3A602C20100100100001 /* Assets.xcassets */,
+				8B3F3A622C20100100100001 /* Resources */,
 				8B3F3A262C20100100100001 /* Info.plist */,
 			);
 			path = MedBottle;
+			sourceTree = "<group>";
+		};
+		8B3F3A622C20100100100001 /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				8B3F3A632C20100100100001 /* studio_lighting.hdr */,
+			);
+			path = Resources;
 			sourceTree = "<group>";
 		};
 		8B3F3A552C20100100100001 /* MedBottleTests */ = {
@@ -200,6 +211,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				8B3F3A612C20100100100001 /* Assets.xcassets in Resources */,
+				8B3F3A642C20100100100001 /* studio_lighting.hdr in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
