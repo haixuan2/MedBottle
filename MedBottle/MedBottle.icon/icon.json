@@ -18,8 +18,8 @@
         {
           "glass" : false,
           "hidden" : false,
-          "image-name" : "image-Photoroom.png",
-          "name" : "image-Photoroom",
+          "image-name" : "icon01.png",
+          "name" : "icon01",
           "position" : {
             "scale" : 0.82,
             "translation-in-points" : [
@@ -31,8 +31,8 @@
         {
           "blend-mode" : "normal",
           "hidden" : true,
-          "image-name" : "image.png",
-          "name" : "image",
+          "image-name" : "icon02.png",
+          "name" : "icon02",
           "position" : {
             "scale" : 1.5,
             "translation-in-points" : [
