@@ -1,0 +1,58 @@
+{
+  "fill" : {
+    "automatic-gradient" : "extended-gray:1.00000,1.00000",
+    "orientation" : {
+      "start" : {
+        "x" : 0.5,
+        "y" : 1
+      },
+      "stop" : {
+        "x" : 0.5,
+        "y" : 0.3
+      }
+    }
+  },
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "glass" : false,
+          "hidden" : false,
+          "image-name" : "image-Photoroom.png",
+          "name" : "image-Photoroom",
+          "position" : {
+            "scale" : 0.82,
+            "translation-in-points" : [
+              25,
+              -2.8700000000000045
+            ]
+          }
+        },
+        {
+          "blend-mode" : "normal",
+          "hidden" : true,
+          "image-name" : "image.png",
+          "name" : "image",
+          "position" : {
+            "scale" : 1.5,
+            "translation-in-points" : [
+              0.75,
+              -45
+            ]
+          }
+        }
+      ],
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.5
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.5
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "squares" : "shared"
+  }
+}
