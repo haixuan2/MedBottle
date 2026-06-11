@@ -26,8 +26,8 @@ final class PersistentMedication {
     ) {
         self.id = id
         self.name = name
-        self.tabletsRemaining = max(0, tabletsRemaining)
-        self.tabletsPerDose = max(1, tabletsPerDose)
+        self.tabletsRemaining = MedicationQuantityLimits.tabletCount.clamping(tabletsRemaining)
+        self.tabletsPerDose = MedicationQuantityLimits.doseCount.clamping(tabletsPerDose)
         self.bottleColorHex = bottleColorHex
         self.medicationShapeRawValue = medicationShape.rawValue
         self.classificationRawValue = classification.rawValue
@@ -58,7 +58,7 @@ final class PersistentMedicationReminder {
         self.frequencyRawValue = frequency.rawValue
         self.weekdayRawValues = weekdays.map(\.rawValue).sorted()
         self.isActive = isActive
-        self.dosageAmount = max(1, dosageAmount)
+        self.dosageAmount = MedicationQuantityLimits.doseCount.clamping(dosageAmount)
     }
 }
 
@@ -87,11 +87,14 @@ final class PersistentDoseRecord {
 
 enum MedicationPersistenceError: LocalizedError, Equatable {
     case medicationNotFound
+    case outOfStock
 
     var errorDescription: String? {
         switch self {
         case .medicationNotFound:
             "This medication could not be found."
+        case .outOfStock:
+            "This bottle is empty. Refill it before logging another dose."
         }
     }
 }
@@ -100,6 +103,7 @@ enum MedicationPersistenceError: LocalizedError, Equatable {
 protocol ActiveMedicationPersisting {
     func medication(id medicationID: Medication.ID) throws -> Medication
     func doseRecords(forMedicationID medicationID: Medication.ID) throws -> [DoseRecord]
+    func logDose(medicationID: Medication.ID, dosageAmount: Int, takenAt: Date) throws -> Medication
     func deleteMedicationPreservingDoseHistory(id medicationID: Medication.ID) throws
 }
 
@@ -122,6 +126,33 @@ struct SwiftDataActiveMedicationStore: ActiveMedicationPersisting {
             .map { $0.toDoseRecord() }
     }
 
+    func logDose(medicationID: Medication.ID, dosageAmount: Int, takenAt: Date) throws -> Medication {
+        let medication = try persistentMedication(id: medicationID)
+        guard medication.tabletsRemaining > 0 else {
+            throw MedicationPersistenceError.outOfStock
+        }
+
+        let dose = max(1, dosageAmount)
+        medication.tabletsRemaining = max(0, medication.tabletsRemaining - dose)
+        medication.lastTakenAt = try latestDoseDate(
+            forMedicationID: medicationID,
+            currentLastTakenAt: medication.lastTakenAt,
+            including: takenAt
+        )
+
+        modelContext.insert(
+            PersistentDoseRecord(
+                medicationID: medication.id,
+                medicationName: medication.name,
+                takenAt: takenAt,
+                tabletCount: dose
+            )
+        )
+        try modelContext.save()
+
+        return medication.toMedication()
+    }
+
     func deleteMedicationPreservingDoseHistory(id medicationID: Medication.ID) throws {
         let medication = try persistentMedication(id: medicationID)
         modelContext.delete(medication)
@@ -135,6 +166,20 @@ struct SwiftDataActiveMedicationStore: ActiveMedicationPersisting {
         }
 
         return medication
+    }
+
+    private func latestDoseDate(
+        forMedicationID medicationID: Medication.ID,
+        currentLastTakenAt: Date?,
+        including takenAt: Date
+    ) throws -> Date {
+        (
+            try modelContext.fetch(FetchDescriptor<PersistentDoseRecord>())
+                .filter { $0.medicationID == medicationID }
+                .map(\.takenAt)
+            + [currentLastTakenAt, takenAt].compactMap { $0 }
+        )
+        .max() ?? takenAt
     }
 }
 
@@ -163,8 +208,8 @@ extension PersistentMedication {
 
     func update(from medication: Medication) {
         name = medication.name
-        tabletsRemaining = max(0, medication.tabletsRemaining)
-        tabletsPerDose = max(1, medication.tabletsPerDose)
+        tabletsRemaining = MedicationQuantityLimits.tabletCount.clamping(medication.tabletsRemaining)
+        tabletsPerDose = MedicationQuantityLimits.doseCount.clamping(medication.tabletsPerDose)
         bottleColorHex = medication.bottleColorHex
         medicationShapeRawValue = medication.medicationShape.rawValue
         classificationRawValue = medication.classification.rawValue
@@ -304,6 +349,161 @@ struct MedicationDetailActions: Hashable, Sendable {
     var refillTitle: String
     var refillSystemImage: String
     var defaultRefillCount: Int
+}
+
+enum MedicationQuantityInputError: LocalizedError, Equatable, Sendable {
+    case empty
+    case invalidNumber
+    case belowMinimum(Int)
+    case aboveMaximum(Int)
+
+    var errorDescription: String? {
+        switch self {
+        case .empty:
+            "Enter a quantity."
+        case .invalidNumber:
+            "Enter a whole number."
+        case .belowMinimum(let minimum):
+            "Enter a quantity of at least \(minimum)."
+        case .aboveMaximum(let maximum):
+            "Enter a quantity of \(maximum) or fewer."
+        }
+    }
+}
+
+struct MedicationQuantityInputConfiguration: Hashable, Sendable {
+    var range: ClosedRange<Int>
+    var step: Int
+    var unitSingular: String
+    var unitPlural: String
+
+    init(
+        range: ClosedRange<Int>,
+        step: Int = 1,
+        unitSingular: String = "tablet",
+        unitPlural: String = "tablets"
+    ) {
+        self.range = range
+        self.step = max(1, step)
+        self.unitSingular = unitSingular
+        self.unitPlural = unitPlural
+    }
+
+    static let tabletCount = MedicationQuantityInputConfiguration(
+        range: MedicationQuantityLimits.tabletCount
+    )
+
+    static let doseCount = MedicationQuantityInputConfiguration(
+        range: MedicationQuantityLimits.doseCount
+    )
+
+    func makeState(value: Int) -> MedicationQuantityInputState {
+        makeState(text: String(range.clamping(value)))
+    }
+
+    func incrementedState(from state: MedicationQuantityInputState) -> MedicationQuantityInputState {
+        guard let value = state.value else {
+            return makeState(value: correctionValue(for: state))
+        }
+
+        return makeState(value: min(value + step, range.upperBound))
+    }
+
+    func decrementedState(from state: MedicationQuantityInputState) -> MedicationQuantityInputState {
+        guard let value = state.value else {
+            return makeState(value: correctionValue(for: state))
+        }
+
+        return makeState(value: max(value - step, range.lowerBound))
+    }
+
+    func makeState(text: String) -> MedicationQuantityInputState {
+        let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !trimmedText.isEmpty else {
+            return MedicationQuantityInputState(
+                text: text,
+                value: nil,
+                validationError: .empty,
+                configuration: self
+            )
+        }
+
+        guard trimmedText.allSatisfy(\.isNumber), let parsedValue = Int(trimmedText) else {
+            return MedicationQuantityInputState(
+                text: text,
+                value: nil,
+                validationError: .invalidNumber,
+                configuration: self
+            )
+        }
+
+        guard parsedValue >= range.lowerBound else {
+            return MedicationQuantityInputState(
+                text: text,
+                value: nil,
+                validationError: .belowMinimum(range.lowerBound),
+                configuration: self
+            )
+        }
+
+        guard parsedValue <= range.upperBound else {
+            return MedicationQuantityInputState(
+                text: text,
+                value: nil,
+                validationError: .aboveMaximum(range.upperBound),
+                configuration: self
+            )
+        }
+
+        return MedicationQuantityInputState(
+            text: text,
+            value: parsedValue,
+            validationError: nil,
+            configuration: self
+        )
+    }
+
+    private func correctionValue(for state: MedicationQuantityInputState) -> Int {
+        switch state.validationError {
+        case .some(.aboveMaximum):
+            range.upperBound
+        case .some(.belowMinimum):
+            range.lowerBound
+        case .some(.empty), .some(.invalidNumber), nil:
+            range.lowerBound
+        }
+    }
+}
+
+struct MedicationQuantityInputState: Equatable, Sendable {
+    var text: String
+    var value: Int?
+    var validationError: MedicationQuantityInputError?
+    var configuration: MedicationQuantityInputConfiguration
+
+    var isValid: Bool {
+        value != nil && validationError == nil
+    }
+
+    var canDecrement: Bool {
+        guard let value else { return false }
+        return value > configuration.range.lowerBound
+    }
+
+    var canIncrement: Bool {
+        guard let value else { return false }
+        return value < configuration.range.upperBound
+    }
+
+    var unitText: String {
+        value == 1 ? configuration.unitSingular : configuration.unitPlural
+    }
+
+    var accessibilityValue: String {
+        guard let value else { return text }
+        return "\(value) \(unitText)"
+    }
 }
 
 struct MedicationDetailSnapshot: Identifiable, Equatable, Sendable {

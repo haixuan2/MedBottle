@@ -13,6 +13,129 @@ private enum MedicationTransitionDirection {
     case backward
 }
 
+struct RefillView: View {
+    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var store: MedicationStore
+
+    let medication: Medication
+    @State private var tabletQuantity: MedicationQuantityInputState
+
+    init(medication: Medication) {
+        self.medication = medication
+        _tabletQuantity = State(initialValue: MedicationQuantityInputConfiguration.tabletCount.makeState(value: medication.tabletsRemaining))
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section(medication.name) {
+                    MedicationQuantityInputRow(
+                        title: "Tablets",
+                        quantity: $tabletQuantity
+                    )
+
+                    Text("Current bottle count: \(medication.remainingText)")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel("Current bottle count")
+                        .accessibilityValue(medication.remainingText)
+                }
+            }
+            .navigationTitle("Refill")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        store.refill(
+                            medication,
+                            to: tabletQuantity.value ?? MedicationQuantityLimits.tabletCount.lowerBound
+                        )
+                        dismiss()
+                    }
+                    .disabled(!tabletQuantity.isValid)
+                }
+            }
+        }
+    }
+}
+
+struct ManualDoseLogView: View {
+    @Environment(\.dismiss) private var dismiss
+
+    let medication: Medication
+    let latestAllowedDate: Date
+    var onSave: (Date) -> Void
+
+    @State private var takenAt: Date
+
+    init(
+        medication: Medication,
+        initialTakenAt: Date = Date(),
+        latestAllowedDate: Date = Date(),
+        onSave: @escaping (Date) -> Void
+    ) {
+        self.medication = medication
+        self.latestAllowedDate = latestAllowedDate
+        self.onSave = onSave
+        _takenAt = State(initialValue: min(initialTakenAt, latestAllowedDate))
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Medication") {
+                    LabeledContent("Name", value: medication.name)
+                    LabeledContent("Current bottle count", value: medication.remainingText)
+                }
+
+                Section("Dose") {
+                    LabeledContent("Tablets taken", value: doseText)
+                }
+
+                Section("Taken") {
+                    DatePicker(
+                        "Date and time",
+                        selection: $takenAt,
+                        in: ...latestAllowedDate,
+                        displayedComponents: [.date, .hourAndMinute]
+                    )
+                    .accessibilityLabel("Taken date and time")
+                    .accessibilityHint("Choose when this dose was taken.")
+                }
+            }
+            .navigationTitle("Add Taken Dose")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        save()
+                    }
+                    .disabled(!canSave)
+                }
+            }
+        }
+    }
+
+    private var canSave: Bool {
+        takenAt <= latestAllowedDate
+    }
+
+    private var doseText: String {
+        "\(medication.tabletsPerDose) tablet\(medication.tabletsPerDose == 1 ? "" : "s")"
+    }
+
+    private func save() {
+        guard canSave else { return }
+        onSave(takenAt)
+        dismiss()
+    }
+}
+
 private struct MedicationSelectionContainer: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -194,16 +317,15 @@ private struct MedicationSelectionContainer: View {
     }
 
     private var background: some View {
-        LinearGradient(
-            colors: [AppTheme.backgroundTop, AppTheme.backgroundBottom],
-            startPoint: .top,
-            endPoint: .bottom
+        MedicationDetailBackground(
+            tint: selectionViewModel.selectedMedication.map { Color(hex: $0.bottleColorHex) }
         )
-        .ignoresSafeArea()
     }
 }
 
 struct MedicationDetailScreen: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     let medication: Medication
     let pageCount: Int
     let selectedIndex: Int?
@@ -218,6 +340,9 @@ struct MedicationDetailScreen: View {
 
     @StateObject private var viewModel: MedicationDetailViewModel
     @State private var dosePulse = false
+    @State private var remainingHighlight = false
+    @State private var doseFeedbackTrigger = 0
+    @State private var manualDoseMedication: Medication?
     private let primaryColor = AppTheme.accent
     private let medicationSwipeThreshold: CGFloat = 96
 
@@ -252,13 +377,13 @@ struct MedicationDetailScreen: View {
     var body: some View {
         GeometryReader { geometry in
             ScrollView {
-                VStack(spacing: 8) {
+                VStack(spacing: 12) {
                     if pageCount > 1 {
                         MedicationPageIndicator(
                             pageCount: pageCount,
                             selectedIndex: selectedIndex ?? 0
                         )
-                        .padding(.bottom, 6)
+                        .padding(.bottom, 2)
                     }
 
                     if let snapshot = viewModel.snapshot {
@@ -268,13 +393,29 @@ struct MedicationDetailScreen: View {
                             isPulsing: dosePulse
                         )
 
-                        MedicationMetricsGrid(metrics: snapshot.metrics)
+                        MedicationStockCard(
+                            status: snapshot.stockStatus,
+                            tint: Color(hex: snapshot.hero.bottleColorHex),
+                            isHighlighted: remainingHighlight,
+                            refillAction: {
+                                onRefill(snapshot.medication)
+                            }
+                        )
+
+                        if let lastTakenMetric = lastTakenMetric(from: snapshot) {
+                            MedicationLastTakenCard(metric: lastTakenMetric)
+                        }
+
+                        MedicationMetricsGrid(metrics: secondaryMetrics(from: snapshot))
 
                         MedicationReminderCard(overview: snapshot.reminderOverview)
 
                         RecentDoseRecordsCard(
                             records: snapshot.recentDoseRecords,
-                            onShowHistory: onShowHistory
+                            onShowHistory: onShowHistory,
+                            onAddManualDose: {
+                                manualDoseMedication = snapshot.medication
+                            }
                         )
                     } else {
                         MedicationDetailLoadingCard()
@@ -284,7 +425,7 @@ struct MedicationDetailScreen: View {
                 .frame(maxWidth: 760)
                 .frame(maxWidth: .infinity)
                 .padding(.horizontal, 20)
-                .padding(.bottom, 112)
+                .padding(.bottom, 84)
             }
             .refreshable {
                 await viewModel.refresh()
@@ -330,9 +471,6 @@ struct MedicationDetailScreen: View {
                         primaryColor: primaryColor,
                         primaryAction: {
                             handlePrimaryAction(snapshot)
-                        },
-                        refillAction: {
-                            onRefill(snapshot.medication)
                         }
                     )
                 }
@@ -354,7 +492,26 @@ struct MedicationDetailScreen: View {
             } message: {
                 Text(viewModel.errorMessage ?? "")
             }
+            .sheet(item: $manualDoseMedication) { medication in
+                ManualDoseLogView(
+                    medication: medication,
+                    latestAllowedDate: viewModel.latestAllowedManualDoseDate
+                ) { takenAt in
+                    viewModel.logManualDose(takenAt: takenAt)
+                }
+            }
+            .sensoryFeedback(.success, trigger: doseFeedbackTrigger)
         }
+    }
+
+    private func secondaryMetrics(from snapshot: MedicationDetailSnapshot) -> [MedicationDetailMetric] {
+        snapshot.metrics.filter { metric in
+            metric.kind != .remaining && metric.kind != .lastTaken
+        }
+    }
+
+    private func lastTakenMetric(from snapshot: MedicationDetailSnapshot) -> MedicationDetailMetric? {
+        snapshot.metrics.first { $0.kind == .lastTaken }
     }
 
     private func bottleSceneHeight(for geometry: GeometryProxy) -> CGFloat {
@@ -410,13 +567,68 @@ struct MedicationDetailScreen: View {
             return
         }
 
-        dosePulse = true
-        viewModel.logDose()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
-            withAnimation(.spring(response: 0.32, dampingFraction: 0.68)) {
+        Task {
+            await viewModel.logDose()
+
+            guard viewModel.errorMessage == nil else { return }
+            triggerDoseFeedback()
+        }
+    }
+
+    private func triggerDoseFeedback() {
+        doseFeedbackTrigger += 1
+
+        withAnimation(feedbackAnimation) {
+            dosePulse = true
+            remainingHighlight = true
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.42) {
+            withAnimation(feedbackAnimation) {
                 dosePulse = false
+                remainingHighlight = false
             }
         }
+    }
+
+    private var feedbackAnimation: Animation? {
+        reduceMotion ? nil : .spring(response: 0.32, dampingFraction: 0.72)
+    }
+}
+
+private struct MedicationDetailBackground: View {
+    let tint: Color?
+
+    var body: some View {
+        ZStack {
+            LinearGradient(
+                colors: [AppTheme.backgroundTop, AppTheme.backgroundBottom],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+
+            if let tint {
+                LinearGradient(
+                    colors: [
+                        tint.opacity(0.20),
+                        tint.opacity(0.07),
+                        .clear
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .center
+                )
+
+                LinearGradient(
+                    colors: [
+                        .clear,
+                        tint.opacity(0.10)
+                    ],
+                    startPoint: .center,
+                    endPoint: .bottomTrailing
+                )
+            }
+        }
+        .ignoresSafeArea()
     }
 }
 
@@ -432,7 +644,9 @@ private struct MedicationPageIndicator: View {
                     .frame(width: index == selectedIndex ? 18 : 6, height: 6)
             }
         }
-        .frame(height: 12)
+        .padding(.horizontal, 10)
+        .frame(height: 28)
+        .liquidGlassCapsuleSurface()
         .accessibilityHidden(true)
     }
 }
@@ -445,12 +659,6 @@ private struct MedicationDetailToolbar: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: "pills.fill")
-                .font(.system(size: 20, weight: .bold))
-                .foregroundStyle(primaryColor)
-                .frame(width: 42, height: 42)
-                .accessibilityLabel("Current medication")
-
             Spacer()
 
             if #available(iOS 26.0, *) {
@@ -566,6 +774,49 @@ struct LiquidGlassButtonStyle: ButtonStyle {
     }
 }
 
+struct LiquidGlassCapsuleButtonStyle: ButtonStyle {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var tint: Color = AppTheme.accent
+
+    @ViewBuilder
+    func makeBody(configuration: Configuration) -> some View {
+        if #available(iOS 26.0, *), !reduceTransparency {
+            nativeGlassBody(configuration: configuration)
+        } else {
+            fallbackBody(configuration: configuration)
+        }
+    }
+
+    @available(iOS 26.0, *)
+    private func nativeGlassBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundStyle(.white)
+            .frame(maxWidth: .infinity)
+            .frame(height: 56)
+            .contentShape(Capsule())
+            .glassEffect(.regular.tint(tint.opacity(0.82)).interactive(), in: .capsule)
+            .scaleEffect(configuration.isPressed ? 0.975 : 1)
+            .animation(reduceMotion ? nil : .spring(response: 0.22, dampingFraction: 0.84), value: configuration.isPressed)
+    }
+
+    private func fallbackBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundStyle(.white)
+            .frame(maxWidth: .infinity)
+            .frame(height: 56)
+            .background(tint, in: Capsule())
+            .overlay {
+                Capsule()
+                    .strokeBorder(Color.white.opacity(0.74), lineWidth: 1)
+            }
+            .scaleEffect(configuration.isPressed ? 0.985 : 1)
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.12), value: configuration.isPressed)
+            .contentShape(Capsule())
+    }
+}
+
 extension View {
     func liquidGlassStyle(
         tint: Color = AppTheme.accent,
@@ -579,6 +830,25 @@ extension View {
                 size: size
             )
         )
+    }
+
+    func liquidGlassCapsuleSurface() -> some View {
+        modifier(LiquidGlassCapsuleSurfaceModifier())
+    }
+}
+
+private struct LiquidGlassCapsuleSurfaceModifier: ViewModifier {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(iOS 26.0, *), !reduceTransparency {
+            content
+                .glassEffect(.regular, in: .capsule)
+        } else {
+            content
+                .background(AppTheme.surface, in: Capsule())
+        }
     }
 }
 
@@ -666,21 +936,16 @@ private struct MedicationDetailHeroSection: View {
     let isPulsing: Bool
 
     var body: some View {
-        VStack(alignment: .center, spacing: 0) {
+        VStack(alignment: .center, spacing: 2) {
             heroText(alignment: .center, textAlignment: .center, titleSize: 24)
                 .frame(maxWidth: 340, alignment: .center)
-                .padding(.bottom, 24)
+                .padding(.bottom, 12)
 
             bottleStage
         }
-        .padding(.horizontal, 14)
-        .padding(.top, 12)
-        .padding(.bottom, 10)
-        .background(AppTheme.surfaceSubtle, in: RoundedRectangle(cornerRadius: 8))
-        .overlay(alignment: .topLeading) {
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(AppTheme.separator, lineWidth: 1)
-        }
+        .padding(.horizontal, 10)
+        .padding(.top, 4)
+        .padding(.bottom, 2)
     }
 
     private func heroText(
@@ -700,6 +965,9 @@ private struct MedicationDetailHeroSection: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.78)
             }
+            .padding(.horizontal, 12)
+            .frame(height: 30)
+            .background(AppTheme.surfaceSubtle, in: Capsule())
 
             Text(snapshot.hero.name)
                 .font(.system(size: titleSize, weight: .semibold, design: .rounded))
@@ -732,15 +1000,186 @@ private struct MedicationMetricsGrid: View {
     let metrics: [MedicationDetailMetric]
 
     private let columns = [
-        GridItem(.flexible(), spacing: 10),
-        GridItem(.flexible(), spacing: 10)
+        GridItem(.flexible(), spacing: 8),
+        GridItem(.flexible(), spacing: 8)
     ]
 
     var body: some View {
-        LazyVGrid(columns: columns, spacing: 10) {
+        LazyVGrid(columns: columns, spacing: 8) {
             ForEach(metrics) { metric in
                 MedicationMetricCard(metric: metric)
             }
+        }
+    }
+}
+
+private struct MedicationLastTakenCard: View {
+    let metric: MedicationDetailMetric
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: iconName)
+                .font(.system(size: 16, weight: .bold))
+                .foregroundStyle(AppTheme.accent)
+                .frame(width: 36, height: 36)
+                .background(AppTheme.accent.opacity(0.11), in: Circle())
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(metric.title)
+                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    .foregroundStyle(AppTheme.secondaryText)
+                    .lineLimit(1)
+
+                Text(metric.value)
+                    .font(.system(size: 18, weight: .bold, design: .rounded))
+                    .foregroundStyle(AppTheme.primaryText)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.72)
+
+                if let subtitle = metric.subtitle {
+                    Text(subtitle)
+                        .font(.system(size: 12, weight: .medium, design: .rounded))
+                        .foregroundStyle(AppTheme.secondaryText)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.82)
+                }
+            }
+
+            Spacer(minLength: 8)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, minHeight: 76, alignment: .leading)
+        .background(AppTheme.surface, in: RoundedRectangle(cornerRadius: 8))
+        .accessibilityElement(children: .combine)
+    }
+
+    private var iconName: String {
+        metric.subtitle == nil ? "checkmark.circle.fill" : "clock"
+    }
+}
+
+private struct MedicationStockCard: View {
+    let status: MedicationStockStatus
+    let tint: Color
+    let isHighlighted: Bool
+    var refillAction: () -> Void
+
+    var body: some View {
+        Button(action: refillAction) {
+            HStack(alignment: .center, spacing: 14) {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        Label(statusTitle, systemImage: statusIcon)
+                            .font(.system(size: 13, weight: .bold, design: .rounded))
+                            .foregroundStyle(statusAccent)
+                            .lineLimit(1)
+
+                        Spacer(minLength: 8)
+
+                        Label("Refill", systemImage: "arrow.triangle.2.circlepath")
+                            .font(.system(size: 12, weight: .bold, design: .rounded))
+                            .foregroundStyle(statusAccent)
+                            .lineLimit(1)
+                    }
+
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text("\(status.remainingCount)")
+                            .font(.system(size: 44, weight: .bold, design: .rounded))
+                            .foregroundStyle(AppTheme.primaryText)
+                            .contentTransition(.numericText())
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.58)
+
+                        Text(tabletLabel)
+                            .font(.system(size: 15, weight: .semibold, design: .rounded))
+                            .foregroundStyle(AppTheme.secondaryText)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.78)
+                    }
+
+                    Text(status.message)
+                        .font(.system(size: 13, weight: .medium, design: .rounded))
+                        .foregroundStyle(AppTheme.secondaryText)
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.82)
+                }
+
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(statusAccent.opacity(0.82))
+                    .frame(width: 30, height: 30)
+                    .background(statusAccent.opacity(0.11), in: Circle())
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity, minHeight: 128, alignment: .leading)
+            .background(cardBackground, in: RoundedRectangle(cornerRadius: 8))
+            .overlay {
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(statusAccent.opacity(isHighlighted ? 0.62 : borderOpacity), lineWidth: isHighlighted ? 2 : 1)
+            }
+            .scaleEffect(isHighlighted ? 1.018 : 1)
+        }
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Remaining, \(status.remainingCount) \(tabletLabel). \(statusTitle). \(status.message)")
+        .accessibilityHint("Opens refill options for this medication.")
+    }
+
+    private var tabletLabel: String {
+        status.remainingCount == 1 ? "tablet" : "tablets"
+    }
+
+    private var statusTitle: String {
+        switch status.level {
+        case .ready:
+            return "On hand"
+        case .low:
+            return "Low stock"
+        case .empty:
+            return "Empty"
+        }
+    }
+
+    private var statusIcon: String {
+        switch status.level {
+        case .ready:
+            return "checkmark.circle.fill"
+        case .low:
+            return "exclamationmark.circle.fill"
+        case .empty:
+            return "arrow.triangle.2.circlepath.circle.fill"
+        }
+    }
+
+    private var statusAccent: Color {
+        switch status.level {
+        case .ready:
+            return tint
+        case .low:
+            return Color(red: 0.72, green: 0.46, blue: 0.10)
+        case .empty:
+            return Color(red: 0.72, green: 0.16, blue: 0.16)
+        }
+    }
+
+    private var borderOpacity: Double {
+        switch status.level {
+        case .ready:
+            return 0.22
+        case .low:
+            return 0.38
+        case .empty:
+            return 0.46
+        }
+    }
+
+    private var cardBackground: Color {
+        switch status.level {
+        case .ready:
+            return AppTheme.surfaceStrong
+        case .low, .empty:
+            return AppTheme.surfaceStrong
         }
     }
 }
@@ -756,7 +1195,7 @@ private struct MedicationMetricCard: View {
                 .lineLimit(1)
 
             Text(metric.value)
-                .font(.system(size: metric.kind == .lastTaken ? 20 : 24, weight: .bold, design: .rounded))
+                .font(.system(size: metric.kind == .lastTaken ? 17 : 21, weight: .bold, design: .rounded))
                 .foregroundStyle(AppTheme.primaryText)
                 .lineLimit(1)
                 .minimumScaleFactor(0.62)
@@ -769,8 +1208,8 @@ private struct MedicationMetricCard: View {
                     .minimumScaleFactor(0.8)
             }
         }
-        .padding(11)
-        .frame(maxWidth: .infinity, minHeight: 92, maxHeight: 92, alignment: .leading)
+        .padding(10)
+        .frame(maxWidth: .infinity, minHeight: 84, maxHeight: 84, alignment: .leading)
         .background(AppTheme.surface, in: RoundedRectangle(cornerRadius: 8))
         .accessibilityElement(children: .combine)
     }
@@ -844,15 +1283,26 @@ private struct MedicationReminderCard: View {
 private struct RecentDoseRecordsCard: View {
     let records: [DoseRecord]
     var onShowHistory: () -> Void
+    var onAddManualDose: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
+            HStack(spacing: 8) {
                 Text("Recent doses")
                     .font(.system(size: 18, weight: .bold, design: .rounded))
                     .foregroundStyle(AppTheme.primaryText)
 
                 Spacer()
+
+                Button(action: onAddManualDose) {
+                    Image(systemName: "plus")
+                        .font(.system(size: 15, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 32, height: 32)
+                        .background(AppTheme.accent, in: Circle())
+                }
+                .accessibilityLabel("Add missed dose")
+                .accessibilityHint("Opens a form to record a dose taken earlier.")
 
                 Button(action: onShowHistory) {
                     Image(systemName: "chevron.right")
@@ -871,9 +1321,14 @@ private struct RecentDoseRecordsCard: View {
                     .foregroundStyle(AppTheme.secondaryText)
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else {
-                VStack(spacing: 8) {
-                    ForEach(records.prefix(3)) { record in
-                        RecentDoseRecordRow(record: record)
+                VStack(spacing: 0) {
+                    let visibleRecords = Array(records.prefix(4))
+                    ForEach(Array(visibleRecords.enumerated()), id: \.element.id) { index, record in
+                        RecentDoseTimelineRow(
+                            record: record,
+                            isFirst: index == 0,
+                            isLast: index == visibleRecords.count - 1
+                        )
                     }
                 }
             }
@@ -883,24 +1338,30 @@ private struct RecentDoseRecordsCard: View {
     }
 }
 
-private struct RecentDoseRecordRow: View {
+private struct RecentDoseTimelineRow: View {
     let record: DoseRecord
+    let isFirst: Bool
+    let isLast: Bool
 
     var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "checkmark")
-                .font(.system(size: 13, weight: .bold))
-                .foregroundStyle(.white)
-                .frame(width: 26, height: 26)
-                .background(AppTheme.accent, in: Circle())
-                .accessibilityHidden(true)
+        HStack(alignment: .top, spacing: 10) {
+            timelineMarker
+                .padding(.top, 1)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(record.takenAt.formatted(date: .abbreviated, time: .shortened))
-                    .font(.system(size: 14, weight: .semibold, design: .rounded))
-                    .foregroundStyle(AppTheme.primaryText)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.78)
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(record.takenAt.formatted(date: .abbreviated, time: .omitted))
+                        .font(.system(size: 14, weight: .semibold, design: .rounded))
+                        .foregroundStyle(AppTheme.primaryText)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.78)
+
+                    Text(record.takenAt.formatted(date: .omitted, time: .shortened))
+                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .foregroundStyle(isFirst ? AppTheme.accent : AppTheme.secondaryText)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                }
 
                 Text("\(record.tabletCount) tablet\(record.tabletCount == 1 ? "" : "s")")
                     .font(.system(size: 12, weight: .medium, design: .rounded))
@@ -909,7 +1370,31 @@ private struct RecentDoseRecordRow: View {
 
             Spacer(minLength: 0)
         }
+        .padding(.bottom, isLast ? 0 : 10)
         .accessibilityElement(children: .combine)
+    }
+
+    private var timelineMarker: some View {
+        VStack(spacing: 0) {
+            ZStack {
+                Circle()
+                    .fill(isFirst ? AppTheme.accent : AppTheme.accent.opacity(0.16))
+                    .frame(width: 24, height: 24)
+
+                Image(systemName: isFirst ? "checkmark" : "circle.fill")
+                    .font(.system(size: isFirst ? 11 : 6, weight: .bold))
+                    .foregroundStyle(isFirst ? .white : AppTheme.accent)
+            }
+            .accessibilityHidden(true)
+
+            if !isLast {
+                Rectangle()
+                    .fill(AppTheme.separator)
+                    .frame(width: 1, height: 28)
+                    .accessibilityHidden(true)
+            }
+        }
+        .frame(width: 24)
     }
 }
 
@@ -918,38 +1403,36 @@ private struct MedicationDetailActionBar: View {
     let isLoading: Bool
     let primaryColor: Color
     var primaryAction: () -> Void
-    var refillAction: () -> Void
 
     var body: some View {
-        HStack(spacing: 10) {
-            Button(action: primaryAction) {
-                Label(actions.primaryTitle, systemImage: actions.primarySystemImage)
-                    .font(.system(size: 17, weight: .bold, design: .rounded))
-                    .foregroundStyle(.white)
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 54)
-                    .background(primaryColor, in: RoundedRectangle(cornerRadius: 8))
+        Group {
+            if #available(iOS 26.0, *) {
+                GlassEffectContainer(spacing: 12) {
+                    primaryButton
+                }
+            } else {
+                primaryButton
             }
-            .disabled(isLoading)
-            .accessibilityLabel(actions.primaryTitle)
-            .accessibilityHint(actions.canLogDose ? "Logs the scheduled dose for this medication." : "Opens refill options for this medication.")
-
-            Button(action: refillAction) {
-                Image(systemName: actions.refillSystemImage)
-                    .font(.system(size: 19, weight: .bold))
-                    .foregroundStyle(primaryColor)
-                    .frame(width: 54, height: 54)
-                    .background(AppTheme.controlSurface, in: RoundedRectangle(cornerRadius: 8))
-            }
-            .disabled(isLoading || !actions.canRefill)
-            .accessibilityLabel(actions.refillTitle)
-            .accessibilityHint("Opens refill options for this medication.")
         }
+        .frame(maxWidth: 760)
+        .frame(maxWidth: .infinity)
         .padding(.horizontal, 20)
         .padding(.top, 8)
         .padding(.bottom, 8)
-        .background(.ultraThinMaterial)
     }
+
+    private var primaryButton: some View {
+        Button(action: primaryAction) {
+            Label(actions.primaryTitle, systemImage: actions.primarySystemImage)
+                .font(.system(size: 17, weight: .bold, design: .rounded))
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(LiquidGlassCapsuleButtonStyle(tint: primaryColor))
+        .disabled(isLoading)
+        .accessibilityLabel(actions.primaryTitle)
+        .accessibilityHint(actions.canLogDose ? "Logs the scheduled dose for this medication." : "Opens refill options for this medication.")
+    }
+
 }
 
 private struct MedicationDetailLoadingCard: View {

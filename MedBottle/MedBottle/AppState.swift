@@ -168,6 +168,11 @@ struct DoseRecord: Identifiable, Codable, Equatable, Sendable {
     var tabletCount: Int
 }
 
+enum MedicationQuantityLimits {
+    static let tabletCount = 0...500
+    static let doseCount = 1...12
+}
+
 @MainActor
 final class MedicationStore: ObservableObject {
     static let medicationsStorageKey = "medications.v1"
@@ -216,17 +221,19 @@ final class MedicationStore: ObservableObject {
         guard let index = medications.firstIndex(where: { $0.id == medicationID }) else { return }
         let dose = max(1, dosageAmount)
         medications[index].tabletsRemaining = max(0, medications[index].tabletsRemaining - dose)
-        medications[index].lastTakenAt = takenAt
-        doseRecords.insert(
-            DoseRecord(
-                id: UUID(),
-                medicationID: medications[index].id,
-                medicationName: medications[index].name,
-                takenAt: takenAt,
-                tabletCount: dose
-            ),
-            at: 0
+        medications[index].lastTakenAt = latestDoseDate(
+            forMedicationID: medicationID,
+            currentLastTakenAt: medications[index].lastTakenAt,
+            including: takenAt
         )
+        let record = DoseRecord(
+            id: UUID(),
+            medicationID: medications[index].id,
+            medicationName: medications[index].name,
+            takenAt: takenAt,
+            tabletCount: dose
+        )
+        doseRecords = (doseRecords + [record]).sorted { $0.takenAt > $1.takenAt }
     }
 
     func addMedication(
@@ -244,8 +251,8 @@ final class MedicationStore: ObservableObject {
         let medication = Medication(
             id: UUID(),
             name: cleanedName,
-            tabletsRemaining: max(0, tablets),
-            tabletsPerDose: max(1, dose),
+            tabletsRemaining: MedicationQuantityLimits.tabletCount.clamping(tablets),
+            tabletsPerDose: MedicationQuantityLimits.doseCount.clamping(dose),
             bottleColorHex: colorHex,
             medicationShape: shape,
             classification: classification,
@@ -261,8 +268,8 @@ final class MedicationStore: ObservableObject {
         let previousMedication = medications[index]
         var updatedMedication = medication
         updatedMedication.name = medication.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        updatedMedication.tabletsRemaining = max(0, medication.tabletsRemaining)
-        updatedMedication.tabletsPerDose = max(1, medication.tabletsPerDose)
+        updatedMedication.tabletsRemaining = MedicationQuantityLimits.tabletCount.clamping(medication.tabletsRemaining)
+        updatedMedication.tabletsPerDose = MedicationQuantityLimits.doseCount.clamping(medication.tabletsPerDose)
         updatedMedication.reminders = sanitizedReminders(medication.reminders)
         medications[index] = updatedMedication
 
@@ -316,7 +323,7 @@ final class MedicationStore: ObservableObject {
 
     func refill(_ medication: Medication, to count: Int) {
         guard let index = medications.firstIndex(where: { $0.id == medication.id }) else { return }
-        medications[index].tabletsRemaining = max(0, count)
+        medications[index].tabletsRemaining = MedicationQuantityLimits.tabletCount.clamping(count)
     }
 
     private func latestDoseDate(forMedicationID medicationID: Medication.ID, excluding recordIDs: Set<DoseRecord.ID>) -> Date? {
@@ -324,6 +331,20 @@ final class MedicationStore: ObservableObject {
             .filter { $0.medicationID == medicationID && !recordIDs.contains($0.id) }
             .map(\.takenAt)
             .max()
+    }
+
+    private func latestDoseDate(
+        forMedicationID medicationID: Medication.ID,
+        currentLastTakenAt: Date?,
+        including takenAt: Date
+    ) -> Date {
+        (
+            doseRecords
+                .filter { $0.medicationID == medicationID }
+                .map(\.takenAt)
+            + [currentLastTakenAt, takenAt].compactMap { $0 }
+        )
+        .max() ?? takenAt
     }
 
     private func replacementSelection(
@@ -360,7 +381,7 @@ final class MedicationStore: ObservableObject {
     private func sanitizedReminders(_ reminders: [Medication.Reminder]) -> [Medication.Reminder] {
         reminders.map { reminder in
             var updatedReminder = reminder
-            updatedReminder.dosageAmount = max(1, reminder.dosageAmount)
+            updatedReminder.dosageAmount = MedicationQuantityLimits.doseCount.clamping(reminder.dosageAmount)
             if updatedReminder.frequency == .specificDays && updatedReminder.weekdays.isEmpty {
                 updatedReminder.weekdays = Set(Medication.Weekday.allCases)
             }
@@ -399,17 +420,21 @@ final class MedicationStore: ObservableObject {
         guard let index = medications.firstIndex(where: { $0.id == medicationID }) else { return }
         let dose = max(1, dosageAmount)
         medications[index].tabletsRemaining = max(0, medications[index].tabletsRemaining - dose)
-        medications[index].lastTakenAt = takenAt
-        doseRecords.insert(
-            DoseRecord(
-                id: UUID(),
-                medicationID: medications[index].id,
-                medicationName: medications[index].name,
-                takenAt: takenAt,
-                tabletCount: dose
-            ),
-            at: 0
+        medications[index].lastTakenAt = (
+            doseRecords
+                .filter { $0.medicationID == medicationID }
+                .map(\.takenAt)
+            + [medications[index].lastTakenAt, takenAt].compactMap { $0 }
         )
+        .max()
+        let record = DoseRecord(
+            id: UUID(),
+            medicationID: medications[index].id,
+            medicationName: medications[index].name,
+            takenAt: takenAt,
+            tabletCount: dose
+        )
+        doseRecords = (doseRecords + [record]).sorted { $0.takenAt > $1.takenAt }
 
         if let medicationData = try? JSONEncoder().encode(medications) {
             UserDefaults.standard.set(medicationData, forKey: medicationsStorageKey)
@@ -418,6 +443,12 @@ final class MedicationStore: ObservableObject {
         if let recordsData = try? JSONEncoder().encode(doseRecords) {
             UserDefaults.standard.set(recordsData, forKey: doseRecordsStorageKey)
         }
+    }
+}
+
+extension ClosedRange where Bound == Int {
+    func clamping(_ value: Int) -> Int {
+        Swift.min(Swift.max(value, lowerBound), upperBound)
     }
 }
 

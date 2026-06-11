@@ -9,8 +9,8 @@ struct AddMedicationView: View {
     @State private var name = ""
     @State private var searchText = ""
     @State private var selectedRXCUI: String?
-    @State private var tabletCount = 30
-    @State private var doseCount = 1
+    @State private var tabletQuantity = MedicationQuantityInputConfiguration.tabletCount.makeState(value: 30)
+    @State private var doseQuantity = MedicationQuantityInputConfiguration.doseCount.makeState(value: 1)
     @State private var colorHex = "D99A00"
     @State private var customColor = Color(hex: "D99A00")
     @State private var medicationShape: MedicationShape = .tablet
@@ -24,8 +24,14 @@ struct AddMedicationView: View {
             Form {
                 Section("Bottle") {
                     medicationSearchField
-                    Stepper("Tablets: \(tabletCount)", value: $tabletCount, in: 0...500)
-                    Stepper("Per dose: \(doseCount)", value: $doseCount, in: 1...12)
+                    MedicationQuantityInputRow(
+                        title: "Tablets",
+                        quantity: $tabletQuantity
+                    )
+                    MedicationQuantityInputRow(
+                        title: "Per dose",
+                        quantity: $doseQuantity
+                    )
                 }
 
                 Section("Medication Shape") {
@@ -56,7 +62,7 @@ struct AddMedicationView: View {
 
                 MedicationReminderSection(
                     medicationName: reminderMedicationName,
-                    dosageAmount: doseCount,
+                    dosageAmount: doseQuantity.value ?? MedicationQuantityLimits.doseCount.lowerBound,
                     reminders: $reminders
                 )
 
@@ -98,8 +104,8 @@ struct AddMedicationView: View {
                     Button("Add") {
                         store.addMedication(
                             name: name,
-                            tablets: tabletCount,
-                            dose: doseCount,
+                            tablets: tabletQuantity.value ?? MedicationQuantityLimits.tabletCount.lowerBound,
+                            dose: doseQuantity.value ?? MedicationQuantityLimits.doseCount.lowerBound,
                             colorHex: colorHex,
                             shape: medicationShape,
                             classification: medicationClassification,
@@ -107,10 +113,16 @@ struct AddMedicationView: View {
                         )
                         dismiss()
                     }
-                    .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(!canAddMedication)
                 }
             }
         }
+    }
+
+    private var canAddMedication: Bool {
+        !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+        tabletQuantity.isValid &&
+        doseQuantity.isValid
     }
 
     private var reminderMedicationName: String {
@@ -213,37 +225,110 @@ struct AddMedicationView: View {
     }
 }
 
-struct RefillView: View {
-    @Environment(\.dismiss) private var dismiss
-    @EnvironmentObject private var store: MedicationStore
+struct MedicationQuantityInputRow: View {
+    let title: String
 
-    let medication: Medication
-    @State private var tabletCount: Int
+    @Binding private var quantity: MedicationQuantityInputState
+    @FocusState private var isFocused: Bool
 
-    init(medication: Medication) {
-        self.medication = medication
-        _tabletCount = State(initialValue: medication.tabletsRemaining)
+    init(
+        title: String,
+        quantity: Binding<MedicationQuantityInputState>
+    ) {
+        self.title = title
+        self._quantity = quantity
     }
 
     var body: some View {
-        NavigationStack {
-            Form {
-                Section(medication.name) {
-                    Stepper("Tablets: \(tabletCount)", value: $tabletCount, in: 0...500)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                    Text(quantitySummary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer(minLength: 12)
+
+                HStack(spacing: 8) {
+                    Button {
+                        decrement()
+                    } label: {
+                        Image(systemName: "minus")
+                            .font(.system(size: 14, weight: .bold))
+                            .frame(width: 30, height: 30)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!quantity.canDecrement)
+                    .accessibilityLabel("Decrease \(title.lowercased())")
+                    .accessibilityValue(quantitySummary)
+
+                    TextField(title, text: quantityText)
+                        .keyboardType(.numberPad)
+                        .multilineTextAlignment(.center)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 76)
+                        .focused($isFocused)
+                        .accessibilityLabel("\(title) quantity")
+                        .accessibilityValue(quantity.accessibilityValue)
+                        .accessibilityHint("Enter a quantity, or use the increment and decrement buttons.")
+                        .onChange(of: isFocused) { _, focused in
+                            if !focused && quantity.isValid {
+                                quantity = quantity.configuration.makeState(value: quantity.value ?? quantity.configuration.range.lowerBound)
+                            }
+                        }
+
+                    Button {
+                        increment()
+                    } label: {
+                        Image(systemName: "plus")
+                            .font(.system(size: 14, weight: .bold))
+                            .frame(width: 30, height: 30)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!quantity.canIncrement)
+                    .accessibilityLabel("Increase \(title.lowercased())")
+                    .accessibilityValue(quantitySummary)
                 }
             }
-            .navigationTitle("Refill")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { dismiss() }
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Save") {
-                        store.refill(medication, to: tabletCount)
-                        dismiss()
-                    }
-                }
+
+            if let errorMessage = quantity.validationError?.localizedDescription {
+                Text(errorMessage)
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+                    .accessibilityLabel("\(title) error: \(errorMessage)")
             }
         }
+        .accessibilityElement(children: .contain)
+        .accessibilityAdjustableAction { direction in
+            switch direction {
+            case .increment:
+                increment()
+            case .decrement:
+                decrement()
+            @unknown default:
+                break
+            }
+        }
+    }
+
+    private var quantitySummary: String {
+        quantity.accessibilityValue
+    }
+
+    private var quantityText: Binding<String> {
+        Binding(
+            get: { quantity.text },
+            set: { quantity = quantity.configuration.makeState(text: $0) }
+        )
+    }
+
+    private func increment() {
+        quantity = quantity.configuration.incrementedState(from: quantity)
+    }
+
+    private func decrement() {
+        quantity = quantity.configuration.decrementedState(from: quantity)
     }
 }

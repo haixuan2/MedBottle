@@ -116,6 +116,48 @@ final class MedicationDetailViewModelTests: XCTestCase {
         XCTAssertFalse(viewModel.isLoading)
     }
 
+    func testViewModelManualDoseUsesSelectedPastDateAndRefreshesSnapshot() async {
+        let now = Date(timeIntervalSince1970: 1_000)
+        let takenAt = Date(timeIntervalSince1970: 400)
+        let medication = makeMedication(tabletsRemaining: 10, tabletsPerDose: 2)
+        let repository = MockMedicationDetailRepository(medication: medication)
+        let viewModel = MedicationDetailViewModel(
+            medicationID: medication.id,
+            repository: repository,
+            snapshotBuilder: MedicationDetailSnapshotBuilder(
+                calendar: Calendar(identifier: .gregorian),
+                now: { now }
+            ),
+            now: { now }
+        )
+
+        await viewModel.logManualDose(takenAt: takenAt)
+
+        XCTAssertEqual(repository.loggedDoseAmounts, [2])
+        XCTAssertEqual(repository.loggedDoseDates, [takenAt])
+        XCTAssertEqual(viewModel.snapshot?.stockStatus.remainingCount, 8)
+        XCTAssertEqual(viewModel.snapshot?.recentDoseRecords.first?.takenAt, takenAt)
+        XCTAssertNil(viewModel.errorMessage)
+        XCTAssertFalse(viewModel.isLoading)
+    }
+
+    func testViewModelManualDoseRejectsFutureDateWithoutCallingRepository() async {
+        let now = Date(timeIntervalSince1970: 1_000)
+        let medication = makeMedication(tabletsRemaining: 10, tabletsPerDose: 2)
+        let repository = MockMedicationDetailRepository(medication: medication)
+        let viewModel = MedicationDetailViewModel(
+            medicationID: medication.id,
+            repository: repository,
+            now: { now }
+        )
+
+        await viewModel.logManualDose(takenAt: Date(timeIntervalSince1970: 1_001))
+
+        XCTAssertTrue(repository.loggedDoseAmounts.isEmpty)
+        XCTAssertEqual(viewModel.errorMessage, MedicationDetailError.futureDoseDate.localizedDescription)
+        XCTAssertFalse(viewModel.isLoading)
+    }
+
     func testViewModelSurfacesRepositoryErrors() async {
         let medication = makeMedication(tabletsRemaining: 0)
         let repository = MockMedicationDetailRepository(medication: medication)
@@ -128,6 +170,144 @@ final class MedicationDetailViewModelTests: XCTestCase {
 
         XCTAssertEqual(viewModel.errorMessage, MedicationDetailError.outOfStock.localizedDescription)
         XCTAssertFalse(viewModel.isLoading)
+    }
+
+    func testQuantityInputViewModelAcceptsTypedQuantityAndStepsWithinBounds() {
+        let viewModel = MedicationQuantityInputViewModel(initialValue: 30)
+
+        viewModel.setText("42")
+        XCTAssertEqual(viewModel.text, "42")
+        XCTAssertEqual(viewModel.value, 42)
+        XCTAssertNil(viewModel.errorMessage)
+
+        viewModel.increment()
+        XCTAssertEqual(viewModel.value, 43)
+        XCTAssertEqual(viewModel.text, "43")
+
+        viewModel.decrement()
+        XCTAssertEqual(viewModel.value, 42)
+
+        viewModel.setText("501")
+        XCTAssertNil(viewModel.value)
+        XCTAssertEqual(viewModel.state.validationError, .aboveMaximum(500))
+
+        viewModel.increment()
+        XCTAssertEqual(viewModel.value, 500)
+        XCTAssertEqual(viewModel.text, "500")
+    }
+
+    func testQuantityInputViewModelKeepsInvalidTypedTextOutOfCommittedValue() {
+        let viewModel = MedicationQuantityInputViewModel(
+            configuration: .doseCount,
+            initialValue: 1
+        )
+
+        viewModel.setText("")
+        XCTAssertNil(viewModel.value)
+        XCTAssertEqual(viewModel.validatedValue(), .failure(.empty))
+
+        viewModel.setText("-1")
+        XCTAssertNil(viewModel.value)
+        XCTAssertEqual(viewModel.validatedValue(), .failure(.invalidNumber))
+
+        viewModel.setText("0")
+        XCTAssertNil(viewModel.value)
+        XCTAssertEqual(viewModel.validatedValue(), .failure(.belowMinimum(1)))
+
+        viewModel.setText("13")
+        XCTAssertNil(viewModel.value)
+        XCTAssertEqual(viewModel.validatedValue(), .failure(.aboveMaximum(12)))
+    }
+
+    func testViewModelRefillUsingTypedQuantityRefreshesSnapshotAndResetsInput() async {
+        let medication = makeMedication(tabletsRemaining: 10, tabletsPerDose: 2)
+        let repository = MockMedicationDetailRepository(medication: medication)
+        let viewModel = MedicationDetailViewModel(
+            medicationID: medication.id,
+            repository: repository,
+            snapshotBuilder: MedicationDetailSnapshotBuilder(
+                calendar: Calendar(identifier: .gregorian),
+                now: { Date(timeIntervalSince1970: 0) }
+            )
+        )
+
+        await viewModel.refresh()
+        XCTAssertEqual(viewModel.refillQuantity.value, 10)
+
+        viewModel.setRefillQuantityText("75")
+        await viewModel.refillUsingQuantityInput()
+
+        XCTAssertEqual(repository.refillCounts, [75])
+        XCTAssertEqual(viewModel.snapshot?.stockStatus.remainingCount, 75)
+        XCTAssertEqual(viewModel.refillQuantity.value, 75)
+        XCTAssertNil(viewModel.errorMessage)
+        XCTAssertFalse(viewModel.isLoading)
+    }
+
+    func testViewModelRefillUsingInvalidTypedQuantitySurfacesValidationError() async {
+        let medication = makeMedication(tabletsRemaining: 10)
+        let repository = MockMedicationDetailRepository(medication: medication)
+        let viewModel = MedicationDetailViewModel(
+            medicationID: medication.id,
+            repository: repository
+        )
+
+        viewModel.setRefillQuantityText("")
+        await viewModel.refillUsingQuantityInput()
+
+        XCTAssertTrue(repository.refillCounts.isEmpty)
+        XCTAssertEqual(viewModel.errorMessage, MedicationQuantityInputError.empty.localizedDescription)
+    }
+
+    func testMedicationStoreClampsTabletAndDoseQuantitiesToSupportedRanges() throws {
+        try withMedicationStoreStorage(medications: [], doseRecords: []) {
+            let store = MedicationStore()
+
+            store.addMedication(
+                name: "Amlodipine",
+                tablets: 700,
+                dose: 99,
+                colorHex: "3A8E84",
+                shape: .tablet,
+                classification: .prescription
+            )
+
+            XCTAssertEqual(store.medications.first?.tabletsRemaining, 500)
+            XCTAssertEqual(store.medications.first?.tabletsPerDose, 12)
+
+            let medication = try XCTUnwrap(store.medications.first)
+            store.refill(medication, to: -50)
+            XCTAssertEqual(store.medications.first?.tabletsRemaining, 0)
+        }
+    }
+
+    func testMedicationStoreManualPastDoseDoesNotRegressLastTakenAt() throws {
+        let medicationID = UUID()
+        let newerDoseDate = Date(timeIntervalSince1970: 300)
+        let olderDoseDate = Date(timeIntervalSince1970: 100)
+        let medication = makeMedication(
+            id: medicationID,
+            tabletsRemaining: 10,
+            tabletsPerDose: 1,
+            lastTakenAt: newerDoseDate
+        )
+        let newerDose = DoseRecord(
+            id: UUID(),
+            medicationID: medicationID,
+            medicationName: medication.name,
+            takenAt: newerDoseDate,
+            tabletCount: 1
+        )
+
+        try withMedicationStoreStorage(medications: [medication], doseRecords: [newerDose]) {
+            let store = MedicationStore()
+
+            store.logDose(forMedicationID: medicationID, dosageAmount: 1, takenAt: olderDoseDate)
+
+            XCTAssertEqual(store.medications.first?.tabletsRemaining, 9)
+            XCTAssertEqual(store.medications.first?.lastTakenAt, newerDoseDate)
+            XCTAssertEqual(store.doseRecords.map(\.takenAt), [newerDoseDate, olderDoseDate])
+        }
     }
 
     func testMedicationStoreDeletePreservesDoseRecordsForDeletedMedication() throws {
@@ -279,6 +459,54 @@ final class MedicationDetailViewModelTests: XCTestCase {
         XCTAssertEqual(
             try context.fetch(FetchDescriptor<PersistentDoseRecord>()).map { $0.toDoseRecord() },
             [doseRecord.toDoseRecord()]
+        )
+    }
+
+    func testSwiftDataLogDoseAddsPastRecordWithoutRegressingLastTakenAt() throws {
+        let schema = Schema([
+            PersistentMedication.self,
+            PersistentMedicationReminder.self,
+            PersistentDoseRecord.self
+        ])
+        let configuration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
+        let container = try ModelContainer(for: schema, configurations: [configuration])
+        let context = ModelContext(container)
+        let medicationID = UUID()
+        let newerDoseDate = Date(timeIntervalSince1970: 300)
+        let olderDoseDate = Date(timeIntervalSince1970: 100)
+        let medication = PersistentMedication(
+            id: medicationID,
+            name: "Amlodipine",
+            tabletsRemaining: 10,
+            tabletsPerDose: 1,
+            bottleColorHex: "3A8E84",
+            medicationShape: .tablet,
+            classification: .prescription,
+            lastTakenAt: newerDoseDate
+        )
+        let newerDose = PersistentDoseRecord(
+            id: UUID(),
+            medicationID: medicationID,
+            medicationName: "Amlodipine",
+            takenAt: newerDoseDate,
+            tabletCount: 1
+        )
+        context.insert(medication)
+        context.insert(newerDose)
+        try context.save()
+
+        let persistence = SwiftDataActiveMedicationStore(modelContext: context)
+        let updatedMedication = try persistence.logDose(
+            medicationID: medicationID,
+            dosageAmount: 1,
+            takenAt: olderDoseDate
+        )
+
+        XCTAssertEqual(updatedMedication.tabletsRemaining, 9)
+        XCTAssertEqual(updatedMedication.lastTakenAt, newerDoseDate)
+        XCTAssertEqual(
+            try persistence.doseRecords(forMedicationID: medicationID).map(\.takenAt),
+            [newerDoseDate, olderDoseDate]
         )
     }
 
@@ -465,6 +693,8 @@ private final class MockMedicationDetailRepository: MedicationDetailRepository {
     private var medicationValue: Medication
     private var records: [DoseRecord] = []
     private(set) var loggedDoseAmounts: [Int] = []
+    private(set) var loggedDoseDates: [Date] = []
+    private(set) var refillCounts: [Int] = []
 
     init(medication: Medication) {
         self.medicationValue = medication
@@ -485,8 +715,9 @@ private final class MockMedicationDetailRepository: MedicationDetailRepository {
 
         let dose = max(1, dosageAmount)
         loggedDoseAmounts.append(dose)
+        loggedDoseDates.append(takenAt)
         medicationValue.tabletsRemaining = max(0, medicationValue.tabletsRemaining - dose)
-        medicationValue.lastTakenAt = takenAt
+        medicationValue.lastTakenAt = ([medicationValue.lastTakenAt, takenAt].compactMap { $0 } + records.map(\.takenAt)).max()
         records.insert(
             DoseRecord(
                 id: UUID(),
@@ -502,8 +733,11 @@ private final class MockMedicationDetailRepository: MedicationDetailRepository {
 
     func refill(medicationID: Medication.ID, to count: Int) async throws -> Medication {
         guard medicationValue.id == medicationID else { throw MedicationDetailError.medicationNotFound }
-        guard count >= 0 else { throw MedicationDetailError.invalidRefillCount }
+        guard MedicationQuantityLimits.tabletCount.contains(count) else {
+            throw MedicationDetailError.invalidRefillCount
+        }
 
+        refillCounts.append(count)
         medicationValue.tabletsRemaining = count
         return medicationValue
     }

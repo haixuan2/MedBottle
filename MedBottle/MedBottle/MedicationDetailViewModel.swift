@@ -6,6 +6,7 @@ enum MedicationDetailError: LocalizedError, Equatable {
     case storeUnavailable
     case outOfStock
     case invalidRefillCount
+    case futureDoseDate
 
     var errorDescription: String? {
         switch self {
@@ -16,7 +17,9 @@ enum MedicationDetailError: LocalizedError, Equatable {
         case .outOfStock:
             "This bottle is empty. Refill it before logging another dose."
         case .invalidRefillCount:
-            "Enter a refill amount of zero or more tablets."
+            "Enter a refill amount between \(MedicationQuantityLimits.tabletCount.lowerBound) and \(MedicationQuantityLimits.tabletCount.upperBound) tablets."
+        case .futureDoseDate:
+            "Choose a dose time that has already passed."
         }
     }
 }
@@ -288,7 +291,9 @@ final class MedicationStoreDetailRepository: MedicationDetailRepository {
 
     func refill(medicationID: Medication.ID, to count: Int) async throws -> Medication {
         guard let store else { throw MedicationDetailError.storeUnavailable }
-        guard count >= 0 else { throw MedicationDetailError.invalidRefillCount }
+        guard MedicationQuantityLimits.tabletCount.contains(count) else {
+            throw MedicationDetailError.invalidRefillCount
+        }
 
         let medication = try currentMedication(id: medicationID)
         store.refill(medication, to: count)
@@ -305,23 +310,87 @@ final class MedicationStoreDetailRepository: MedicationDetailRepository {
 }
 
 @MainActor
+final class MedicationQuantityInputViewModel: ObservableObject {
+    @Published private(set) var state: MedicationQuantityInputState
+
+    private let configuration: MedicationQuantityInputConfiguration
+
+    init(
+        configuration: MedicationQuantityInputConfiguration = .tabletCount,
+        initialValue: Int
+    ) {
+        self.configuration = configuration
+        self.state = configuration.makeState(value: initialValue)
+    }
+
+    var text: String {
+        state.text
+    }
+
+    var value: Int? {
+        state.value
+    }
+
+    var errorMessage: String? {
+        state.validationError?.localizedDescription
+    }
+
+    func setText(_ text: String) {
+        state = configuration.makeState(text: text)
+    }
+
+    func setValue(_ value: Int) {
+        state = configuration.makeState(value: value)
+    }
+
+    func increment() {
+        state = configuration.incrementedState(from: state)
+    }
+
+    func decrement() {
+        state = configuration.decrementedState(from: state)
+    }
+
+    func validatedValue() -> Result<Int, MedicationQuantityInputError> {
+        if let value = state.value {
+            return .success(value)
+        }
+
+        return .failure(state.validationError ?? .empty)
+    }
+}
+
+@MainActor
 final class MedicationDetailViewModel: ObservableObject {
     @Published private(set) var snapshot: MedicationDetailSnapshot?
+    @Published private(set) var refillQuantity: MedicationQuantityInputState
     @Published private(set) var isLoading = false
     @Published private(set) var errorMessage: String?
 
     private let medicationID: Medication.ID
     private let repository: MedicationDetailRepository
     private let snapshotBuilder: MedicationDetailSnapshotBuilding
+    private let refillQuantityConfiguration: MedicationQuantityInputConfiguration
+    private let now: @Sendable () -> Date
+    private var hasEditedRefillQuantity = false
+
+    var latestAllowedManualDoseDate: Date {
+        now()
+    }
 
     init(
         medicationID: Medication.ID,
         repository: MedicationDetailRepository,
-        snapshotBuilder: MedicationDetailSnapshotBuilding = MedicationDetailSnapshotBuilder()
+        snapshotBuilder: MedicationDetailSnapshotBuilding = MedicationDetailSnapshotBuilder(),
+        refillQuantityConfiguration: MedicationQuantityInputConfiguration = .tabletCount,
+        now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.medicationID = medicationID
         self.repository = repository
         self.snapshotBuilder = snapshotBuilder
+        self.refillQuantityConfiguration = refillQuantityConfiguration
+        self.now = now
+        self.refillQuantity = refillQuantityConfiguration.makeState(value: refillQuantityConfiguration.range.lowerBound)
     }
 
     convenience init(
@@ -351,12 +420,29 @@ final class MedicationDetailViewModel: ObservableObject {
     }
 
     func logDose() async {
+        await logDose(takenAt: now())
+    }
+
+    func logManualDose(takenAt: Date) {
+        Task { await logManualDose(takenAt: takenAt) }
+    }
+
+    func logManualDose(takenAt: Date) async {
+        await logDose(takenAt: takenAt)
+    }
+
+    func logDose(takenAt: Date) async {
+        guard takenAt <= now() else {
+            errorMessage = MedicationDetailError.futureDoseDate.localizedDescription
+            return
+        }
+
         await performLoadingOperation {
             let currentMedication = try await repository.medication(id: medicationID)
             _ = try await repository.logDose(
                 medicationID: medicationID,
                 dosageAmount: currentMedication.tabletsPerDose,
-                takenAt: Date()
+                takenAt: takenAt
             )
             return try await loadSnapshot()
         }
@@ -370,6 +456,43 @@ final class MedicationDetailViewModel: ObservableObject {
         await performLoadingOperation {
             _ = try await repository.refill(medicationID: medicationID, to: count)
             return try await loadSnapshot()
+        }
+
+        if errorMessage == nil, let snapshot {
+            resetRefillQuantity(to: snapshot.medication.tabletsRemaining)
+        }
+    }
+
+    func setRefillQuantityText(_ text: String) {
+        hasEditedRefillQuantity = true
+        refillQuantity = refillQuantityConfiguration.makeState(text: text)
+    }
+
+    func incrementRefillQuantity() {
+        hasEditedRefillQuantity = true
+        refillQuantity = refillQuantityConfiguration.incrementedState(from: refillQuantity)
+    }
+
+    func decrementRefillQuantity() {
+        hasEditedRefillQuantity = true
+        refillQuantity = refillQuantityConfiguration.decrementedState(from: refillQuantity)
+    }
+
+    func resetRefillQuantity() {
+        let count = snapshot?.medication.tabletsRemaining ?? refillQuantityConfiguration.range.lowerBound
+        resetRefillQuantity(to: count)
+    }
+
+    func refillUsingQuantityInput() {
+        Task { await refillUsingQuantityInput() }
+    }
+
+    func refillUsingQuantityInput() async {
+        switch validatedRefillQuantity() {
+        case .success(let count):
+            await refill(to: count)
+        case .failure(let error):
+            errorMessage = error.localizedDescription
         }
     }
 
@@ -389,6 +512,7 @@ final class MedicationDetailViewModel: ObservableObject {
 
         do {
             snapshot = try await operation()
+            syncRefillQuantityIfNeeded()
         } catch let error as MedicationDetailError {
             errorMessage = error.localizedDescription
         } catch {
@@ -396,6 +520,24 @@ final class MedicationDetailViewModel: ObservableObject {
         }
 
         isLoading = false
+    }
+
+    private func validatedRefillQuantity() -> Result<Int, MedicationQuantityInputError> {
+        if let value = refillQuantity.value {
+            return .success(value)
+        }
+
+        return .failure(refillQuantity.validationError ?? .empty)
+    }
+
+    private func syncRefillQuantityIfNeeded() {
+        guard !hasEditedRefillQuantity, let snapshot else { return }
+        refillQuantity = refillQuantityConfiguration.makeState(value: snapshot.medication.tabletsRemaining)
+    }
+
+    private func resetRefillQuantity(to count: Int) {
+        hasEditedRefillQuantity = false
+        refillQuantity = refillQuantityConfiguration.makeState(value: count)
     }
 }
 
