@@ -4,8 +4,10 @@ import SwiftUI
 @MainActor
 struct BottleSceneView: UIViewRepresentable {
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     let medication: Medication
+    var onInteractionBegan: () -> Void = {}
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -19,14 +21,21 @@ struct BottleSceneView: UIViewRepresentable {
         view.allowsCameraControl = false
         view.autoenablesDefaultLighting = false
         view.isPlaying = false
-        view.preferredFramesPerSecond = 30
-        let scene = context.coordinator.scene ?? BottleSceneFactory.scene(for: medication, colorScheme: colorScheme)
+        view.preferredFramesPerSecond = BottleSceneMotionPolicy.preferredFramesPerSecond(reduceMotion: reduceMotion)
+        context.coordinator.configure(reduceMotion: reduceMotion, onInteractionBegan: onInteractionBegan)
+        let scene = context.coordinator.scene ?? BottleSceneFactory.scene(
+            for: medication,
+            colorScheme: colorScheme,
+            reduceMotion: reduceMotion
+        )
         scene.isPaused = true
         context.coordinator.scene = scene
         view.scene = scene
         context.coordinator.sceneView = view
         context.coordinator.renderedState = SceneRenderState(medication: medication, colorScheme: colorScheme)
-        context.coordinator.playTemporarily()
+        if BottleSceneMotionPolicy.shouldAutoPlay(reduceMotion: reduceMotion) {
+            context.coordinator.playTemporarily()
+        }
 
         let pan = UIPanGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handlePan(_:)))
         pan.maximumNumberOfTouches = 1
@@ -35,8 +44,14 @@ struct BottleSceneView: UIViewRepresentable {
     }
 
     func updateUIView(_ view: SCNView, context: Context) {
+        view.preferredFramesPerSecond = BottleSceneMotionPolicy.preferredFramesPerSecond(reduceMotion: reduceMotion)
+        context.coordinator.configure(reduceMotion: reduceMotion, onInteractionBegan: onInteractionBegan)
         if view.scene == nil {
-            let scene = context.coordinator.scene ?? BottleSceneFactory.scene(for: medication, colorScheme: colorScheme)
+            let scene = context.coordinator.scene ?? BottleSceneFactory.scene(
+                for: medication,
+                colorScheme: colorScheme,
+                reduceMotion: reduceMotion
+            )
             context.coordinator.scene = scene
             view.scene = scene
         }
@@ -46,10 +61,13 @@ struct BottleSceneView: UIViewRepresentable {
             BottleSceneFactory.update(
                 scene: context.coordinator.scene ?? view.scene,
                 medication: medication,
-                colorScheme: colorScheme
+                colorScheme: colorScheme,
+                reduceMotion: reduceMotion
             )
             context.coordinator.renderedState = nextState
-            context.coordinator.playTemporarily()
+            if BottleSceneMotionPolicy.shouldAutoPlay(reduceMotion: reduceMotion) {
+                context.coordinator.playTemporarily()
+            }
         }
         context.coordinator.sceneView = view
     }
@@ -62,6 +80,8 @@ struct BottleSceneView: UIViewRepresentable {
         private var accumulatedRotation: Float = 0
         private var gestureStartRotation: Float = 0
         private var playbackStopTask: Task<Void, Never>?
+        private var reduceMotion = false
+        private var onInteractionBegan: () -> Void = {}
 
         deinit {
             playbackStopTask?.cancel()
@@ -73,6 +93,7 @@ struct BottleSceneView: UIViewRepresentable {
 
             switch recognizer.state {
             case .began:
+                onInteractionBegan()
                 startPlayback()
                 gestureStartRotation = accumulatedRotation
             case .changed:
@@ -81,7 +102,11 @@ struct BottleSceneView: UIViewRepresentable {
             case .ended, .cancelled, .failed:
                 accumulatedRotation = gestureStartRotation + Float(translation.x) * 0.012
                 BottleSceneFactory.applyInteractiveRotation(scene: scene, rotation: accumulatedRotation, horizontalOffset: 0)
-                playTemporarily(duration: 0.8)
+                if reduceMotion {
+                    stopPlayback()
+                } else {
+                    playTemporarily(duration: 0.8)
+                }
             default:
                 break
             }
@@ -96,6 +121,15 @@ struct BottleSceneView: UIViewRepresentable {
                 await MainActor.run {
                     self?.stopPlayback()
                 }
+            }
+        }
+
+        func configure(reduceMotion: Bool, onInteractionBegan: @escaping () -> Void) {
+            self.reduceMotion = reduceMotion
+            self.onInteractionBegan = onInteractionBegan
+
+            if reduceMotion {
+                stopPlayback()
             }
         }
 
@@ -130,6 +164,20 @@ struct BottleSceneView: UIViewRepresentable {
             medicationShape = medication.medicationShape
             self.colorScheme = colorScheme
         }
+    }
+}
+
+enum BottleSceneMotionPolicy {
+    static func preferredFramesPerSecond(reduceMotion: Bool) -> Int {
+        reduceMotion ? 30 : 60
+    }
+
+    static func shouldAutoPlay(reduceMotion: Bool) -> Bool {
+        !reduceMotion
+    }
+
+    static func shouldAnimateInventoryChange(reduceMotion: Bool) -> Bool {
+        !reduceMotion
     }
 }
 
@@ -240,7 +288,7 @@ enum BottleSceneFactory {
         }
     }
 
-    static func scene(for medication: Medication, colorScheme: ColorScheme) -> SCNScene {
+    static func scene(for medication: Medication, colorScheme: ColorScheme, reduceMotion: Bool) -> SCNScene {
         previousInteractiveRotation = nil
 
         let lighting = LightingProfile.profile(for: colorScheme)
@@ -274,11 +322,11 @@ enum BottleSceneFactory {
         let tablets = tabletsNode(count: medication.tabletsRemaining, shape: medication.medicationShape)
         assembly.addChildNode(tablets)
 
-        update(scene: scene, medication: medication, colorScheme: colorScheme)
+        update(scene: scene, medication: medication, colorScheme: colorScheme, reduceMotion: reduceMotion)
         return scene
     }
 
-    static func update(scene: SCNScene?, medication: Medication, colorScheme: ColorScheme) {
+    static func update(scene: SCNScene?, medication: Medication, colorScheme: ColorScheme, reduceMotion: Bool) {
         guard let scene else { return }
         updateLighting(in: scene, colorScheme: colorScheme)
         guard let assembly = scene.rootNode.childNode(withName: NodeName.assembly, recursively: false) else { return }
@@ -305,7 +353,12 @@ enum BottleSceneFactory {
                 let newTablets = tabletsNode(count: medication.tabletsRemaining, shape: medication.medicationShape)
                 assembly.addChildNode(newTablets)
             } else {
-                reconcileTabletCount(in: tablets, count: medication.tabletsRemaining, shape: medication.medicationShape)
+                reconcileTabletCount(
+                    in: tablets,
+                    count: medication.tabletsRemaining,
+                    shape: medication.medicationShape,
+                    animated: BottleSceneMotionPolicy.shouldAnimateInventoryChange(reduceMotion: reduceMotion)
+                )
             }
         }
     }
@@ -869,35 +922,39 @@ enum BottleSceneFactory {
         return group
     }
 
-    private static func reconcileTabletCount(in group: SCNNode, count: Int, shape: MedicationShape) {
+    private static func reconcileTabletCount(in group: SCNNode, count: Int, shape: MedicationShape, animated: Bool) {
         let targetCount = min(count, 18)
         let activePills = group.childNodes.filter { $0.name == NodeName.pill }
 
         if activePills.count > targetCount {
             let removalCount = activePills.count - targetCount
             for node in activePills.suffix(removalCount) {
-                removePillGracefully(node)
+                removePillGracefully(node, animated: animated)
             }
         } else if activePills.count < targetCount {
             for index in activePills.count..<targetCount {
-                group.addChildNode(tabletNode(shape: shape, index: index, visibleCount: targetCount))
+                group.addChildNode(tabletNode(shape: shape, index: index, visibleCount: targetCount, enters: animated))
             }
         }
     }
 
-    private static func removePillGracefully(_ node: SCNNode) {
+    private static func removePillGracefully(_ node: SCNNode, animated: Bool) {
         node.name = NodeName.pillRemoving
         node.physicsBody = nil
 
-        SCNTransaction.begin()
-        SCNTransaction.animationDuration = 0.3
-        let shrink = SCNAction.scale(to: 0, duration: 0.3)
-        shrink.timingMode = .easeInEaseOut
-        node.runAction(.sequence([shrink, .removeFromParentNode()]))
-        SCNTransaction.commit()
+        guard animated else {
+            node.removeFromParentNode()
+            return
+        }
+
+        let fade = SCNAction.fadeOut(duration: 0.18)
+        let shrink = SCNAction.scale(to: 0.94, duration: 0.18)
+        fade.timingMode = .easeOut
+        shrink.timingMode = .easeOut
+        node.runAction(.sequence([.group([fade, shrink]), .removeFromParentNode()]))
     }
 
-    private static func tabletNode(shape: MedicationShape, index: Int, visibleCount: Int) -> SCNNode {
+    private static func tabletNode(shape: MedicationShape, index: Int, visibleCount: Int, enters: Bool = false) -> SCNNode {
         let tablet = tabletGeometry(for: shape)
         let material = SCNMaterial()
         material.diffuse.contents = tabletColor(for: shape, index: index)
@@ -915,6 +972,17 @@ enum BottleSceneFactory {
         node.physicsBody = pillPhysicsBody(for: tablet)
         node.physicsBody?.isAffectedByGravity = true
         node.castsShadow = true
+
+        if enters {
+            node.opacity = 0
+            node.scale = SCNVector3(0.96, 0.96, 0.96)
+
+            let fade = SCNAction.fadeIn(duration: 0.16)
+            let grow = SCNAction.scale(to: 1, duration: 0.16)
+            fade.timingMode = .easeOut
+            grow.timingMode = .easeOut
+            node.runAction(.group([fade, grow]))
+        }
         return node
     }
 

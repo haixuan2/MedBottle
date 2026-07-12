@@ -339,10 +339,10 @@ struct MedicationDetailScreen: View {
     var onMoveNext: () -> Void
 
     @StateObject private var viewModel: MedicationDetailViewModel
-    @State private var dosePulse = false
     @State private var remainingHighlight = false
     @State private var doseFeedbackTrigger = 0
     @State private var manualDoseMedication: Medication?
+    @State private var isBottleInteractionActive = false
     private let primaryColor = AppTheme.accent
     private let medicationSwipeThreshold: CGFloat = 96
 
@@ -390,7 +390,9 @@ struct MedicationDetailScreen: View {
                         MedicationDetailHeroSection(
                             snapshot: snapshot,
                             sceneHeight: bottleSceneHeight(for: geometry),
-                            isPulsing: dosePulse
+                            onBottleInteractionBegan: {
+                                isBottleInteractionActive = true
+                            }
                         )
 
                         MedicationStockCard(
@@ -542,6 +544,9 @@ struct MedicationDetailScreen: View {
     }
 
     private func handleMedicationSwipe(_ value: DragGesture.Value) {
+        defer { isBottleInteractionActive = false }
+
+        guard !isBottleInteractionActive else { return }
         guard pageCount > 1 else { return }
 
         let horizontalDistance = value.translation.width
@@ -579,13 +584,11 @@ struct MedicationDetailScreen: View {
         doseFeedbackTrigger += 1
 
         withAnimation(feedbackAnimation) {
-            dosePulse = true
             remainingHighlight = true
         }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.42) {
             withAnimation(feedbackAnimation) {
-                dosePulse = false
                 remainingHighlight = false
             }
         }
@@ -933,7 +936,9 @@ struct LiquidGlassButtonStyleExampleContentView: View {
 private struct MedicationDetailHeroSection: View {
     let snapshot: MedicationDetailSnapshot
     let sceneHeight: CGFloat
-    let isPulsing: Bool
+    var onBottleInteractionBegan: () -> Void
+    @AppStorage("hasDiscoveredBottleRotation") private var hasDiscoveredBottleRotation = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         VStack(alignment: .center, spacing: 2) {
@@ -980,10 +985,12 @@ private struct MedicationDetailHeroSection: View {
     }
 
     private func bottleScene(height: CGFloat) -> some View {
-        BottleSceneView(medication: snapshot.medication)
+        BottleSceneView(medication: snapshot.medication) {
+            hasDiscoveredBottleRotation = true
+            onBottleInteractionBegan()
+        }
             .frame(maxWidth: .infinity)
             .frame(height: height)
-            .scaleEffect(isPulsing ? 0.985 : 1)
             .accessibilityLabel("\(snapshot.hero.name) bottle visualization")
             .accessibilityHint("Drag horizontally to rotate the bottle.")
     }
@@ -993,6 +1000,18 @@ private struct MedicationDetailHeroSection: View {
             .frame(maxWidth: 360, alignment: .center)
             .frame(height: sceneHeight, alignment: .center)
             .clipped()
+            .overlay(alignment: .bottom) {
+                if !hasDiscoveredBottleRotation && !reduceMotion {
+                    Label("Drag to rotate", systemImage: "rotate.3d")
+                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .foregroundStyle(AppTheme.secondaryText)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(AppTheme.surfaceSubtle, in: Capsule())
+                        .padding(.bottom, 4)
+                        .accessibilityHidden(true)
+                }
+            }
     }
 }
 

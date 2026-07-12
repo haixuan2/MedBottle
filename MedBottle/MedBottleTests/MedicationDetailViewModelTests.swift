@@ -5,6 +5,18 @@ import XCTest
 
 @MainActor
 final class MedicationDetailViewModelTests: XCTestCase {
+    func testBottleMotionPolicyDisablesAutomaticMotionForReducedMotion() {
+        XCTAssertFalse(BottleSceneMotionPolicy.shouldAutoPlay(reduceMotion: true))
+        XCTAssertFalse(BottleSceneMotionPolicy.shouldAnimateInventoryChange(reduceMotion: true))
+        XCTAssertEqual(BottleSceneMotionPolicy.preferredFramesPerSecond(reduceMotion: true), 30)
+    }
+
+    func testBottleMotionPolicyUsesSmoothInteractiveFrameRate() {
+        XCTAssertTrue(BottleSceneMotionPolicy.shouldAutoPlay(reduceMotion: false))
+        XCTAssertTrue(BottleSceneMotionPolicy.shouldAnimateInventoryChange(reduceMotion: false))
+        XCTAssertEqual(BottleSceneMotionPolicy.preferredFramesPerSecond(reduceMotion: false), 60)
+    }
+
     func testSnapshotBuilderClampsEmptyStockAndSortsDoseHistory() {
         let medicationID = UUID()
         let olderDose = DoseRecord(
