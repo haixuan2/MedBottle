@@ -79,6 +79,7 @@ struct BottleSceneView: UIViewRepresentable {
         var renderedState: SceneRenderState?
         private var accumulatedRotation: Float = 0
         private var gestureStartRotation: Float = 0
+        private var previousInteractiveRotation: Float = 0
         private var playbackStopTask: Task<Void, Never>?
         private var reduceMotion = false
         private var onInteractionBegan: () -> Void = {}
@@ -96,12 +97,27 @@ struct BottleSceneView: UIViewRepresentable {
                 onInteractionBegan()
                 startPlayback()
                 gestureStartRotation = accumulatedRotation
+                previousInteractiveRotation = accumulatedRotation
             case .changed:
                 let rotation = gestureStartRotation + Float(translation.x) * 0.012
-                BottleSceneFactory.applyInteractiveRotation(scene: scene, rotation: rotation, horizontalOffset: translation.x)
+                let delta = BottleSceneMotionPolicy.normalizedRotationDelta(
+                    from: previousInteractiveRotation,
+                    to: rotation
+                )
+                BottleSceneFactory.applyInteractiveRotation(scene: scene, rotation: rotation, rotationDelta: delta)
+                previousInteractiveRotation = rotation
             case .ended, .cancelled, .failed:
                 accumulatedRotation = gestureStartRotation + Float(translation.x) * 0.012
-                BottleSceneFactory.applyInteractiveRotation(scene: scene, rotation: accumulatedRotation, horizontalOffset: 0)
+                let delta = BottleSceneMotionPolicy.normalizedRotationDelta(
+                    from: previousInteractiveRotation,
+                    to: accumulatedRotation
+                )
+                BottleSceneFactory.applyInteractiveRotation(
+                    scene: scene,
+                    rotation: accumulatedRotation,
+                    rotationDelta: delta
+                )
+                previousInteractiveRotation = accumulatedRotation
                 if reduceMotion {
                     stopPlayback()
                 } else {
@@ -179,6 +195,13 @@ enum BottleSceneMotionPolicy {
     static func shouldAnimateInventoryChange(reduceMotion: Bool) -> Bool {
         !reduceMotion
     }
+
+    static func normalizedRotationDelta(from previous: Float, to current: Float) -> Float {
+        var delta = current - previous
+        while delta > Float.pi { delta -= Float.pi * 2 }
+        while delta < -Float.pi { delta += Float.pi * 2 }
+        return delta
+    }
 }
 
 @MainActor
@@ -196,8 +219,10 @@ enum BottleSceneFactory {
         static let pill = "pill"
         static let pillRemoving = "pillRemoving"
         static let shadowPlane = "shadowPlane"
+        static let collisionEnvelope = "collisionEnvelope"
         static let collisionFloor = "collisionFloor"
         static let collisionWalls = "collisionWalls"
+        static let collisionLid = "collisionLid"
         static let keyLight = "keyLight"
         static let fillLight = "fillLight"
         static let ambientLight = "ambientLight"
@@ -211,13 +236,17 @@ enum BottleSceneFactory {
     private enum PhysicsMetrics {
         static let wallInnerRadius: CGFloat = 0.62
         static let wallThickness: CGFloat = 0.18
-        static let wallHeight: CGFloat = 2.42
-        static let wallCenterY: Float = -0.27
+        static let floorTop: Float = -1.475
+        static let lidBottom: Float = 1.389
+        static let boundaryThickness: CGFloat = 0.02
+        static let wallHeight = CGFloat(lidBottom - floorTop)
+        static let wallCenterY = (floorTop + lidBottom) / 2
         static let wallSegmentCount = 16
 
         static let floorRadius: CGFloat = 0.62
-        static let floorThickness: CGFloat = 0.02
-        static let floorCenterY: Float = -1.485
+        static let floorCenterY = floorTop - Float(boundaryThickness / 2)
+        static let lidCenterY = lidBottom + Float(boundaryThickness / 2)
+        static let envelopePosition = SCNVector3(0, -0.08, 0)
 
         static let spawnColumns = 6
         static let spawnRingRadius: Float = 0.30
@@ -228,6 +257,7 @@ enum BottleSceneFactory {
         static let maxSpinImpulse: Float = 0.055
 
         static let collisionMargin: CGFloat = 0.001
+        static let continuousCollisionDetectionThreshold: CGFloat = 0.044
     }
 
     private enum LabelMetrics {
@@ -269,7 +299,6 @@ enum BottleSceneFactory {
         }
     }
 
-    private static var previousInteractiveRotation: Float?
     private static var labelImageCache: [LabelImageKey: UIImage] = [:]
 
     private struct LightingProfile {
@@ -289,8 +318,6 @@ enum BottleSceneFactory {
     }
 
     static func scene(for medication: Medication, colorScheme: ColorScheme, reduceMotion: Bool) -> SCNScene {
-        previousInteractiveRotation = nil
-
         let lighting = LightingProfile.profile(for: colorScheme)
         let scene = SCNScene()
         scene.physicsWorld.gravity = SCNVector3(0, -9.8, 0)
@@ -316,8 +343,7 @@ enum BottleSceneFactory {
         label.position = SCNVector3(0, 0.18, 0)
         bottle.addChildNode(label)
 
-        bottle.addChildNode(collisionFloorNode())
-        bottle.addChildNode(collisionWallsNode())
+        assembly.addChildNode(collisionEnvelopeNode())
 
         let tablets = tabletsNode(count: medication.tabletsRemaining, shape: medication.medicationShape)
         assembly.addChildNode(tablets)
@@ -363,37 +389,15 @@ enum BottleSceneFactory {
         }
     }
 
-    static func applyInteractiveRotation(scene: SCNScene, rotation: Float, horizontalOffset: CGFloat) {
+    static func applyInteractiveRotation(scene: SCNScene, rotation: Float, rotationDelta: Float) {
         guard let bottle = scene.rootNode.childNode(withName: NodeName.bottle, recursively: true) else { return }
-        let delta = rotationDelta(rotation: rotation)
 
         SCNTransaction.begin()
         SCNTransaction.animationDuration = 0
         bottle.eulerAngles = SCNVector3(0, rotation, 0)
         SCNTransaction.commit()
 
-        synchronizeContainerPhysics(in: bottle)
-        applyRotationalDrag(in: scene, delta: delta)
-    }
-
-    private static func rotationDelta(rotation: Float) -> Float {
-        let previous = previousInteractiveRotation ?? rotation
-        previousInteractiveRotation = rotation
-
-        var delta = rotation - previous
-        while delta > Float.pi { delta -= Float.pi * 2 }
-        while delta < -Float.pi { delta += Float.pi * 2 }
-        return delta
-    }
-
-    private static func synchronizeContainerPhysics(in node: SCNNode) {
-        if node.physicsBody?.categoryBitMask == PhysicsCategory.container {
-            node.physicsBody?.resetTransform()
-        }
-
-        for child in node.childNodes {
-            synchronizeContainerPhysics(in: child)
-        }
+        applyRotationalDrag(in: scene, delta: rotationDelta)
     }
 
     private static func removeLegacyFillNodes(from node: SCNNode) {
@@ -803,8 +807,18 @@ enum BottleSceneFactory {
         )
     }
 
+    private static func collisionEnvelopeNode() -> SCNNode {
+        let envelope = SCNNode()
+        envelope.name = NodeName.collisionEnvelope
+        envelope.position = PhysicsMetrics.envelopePosition
+        envelope.addChildNode(collisionFloorNode())
+        envelope.addChildNode(collisionWallsNode())
+        envelope.addChildNode(collisionLidNode())
+        return envelope
+    }
+
     private static func collisionFloorNode() -> SCNNode {
-        let floor = SCNCylinder(radius: PhysicsMetrics.floorRadius, height: PhysicsMetrics.floorThickness)
+        let floor = SCNCylinder(radius: PhysicsMetrics.floorRadius, height: PhysicsMetrics.boundaryThickness)
         floor.radialSegmentCount = 96
         floor.materials = [invisibleCollisionMaterial()]
 
@@ -825,6 +839,34 @@ enum BottleSceneFactory {
         body.collisionBitMask = PhysicsCategory.pill
         body.contactTestBitMask = 0
         body.friction = 0.96
+        body.restitution = 0.04
+        node.physicsBody = body
+        node.geometry = nil
+        return node
+    }
+
+    private static func collisionLidNode() -> SCNNode {
+        let lid = SCNCylinder(radius: PhysicsMetrics.floorRadius, height: PhysicsMetrics.boundaryThickness)
+        lid.radialSegmentCount = 96
+        lid.materials = [invisibleCollisionMaterial()]
+
+        let node = SCNNode(geometry: lid)
+        node.name = NodeName.collisionLid
+        node.position = SCNVector3(0, PhysicsMetrics.lidCenterY, 0)
+        prepareCollisionOnlyNode(node)
+
+        let shape = SCNPhysicsShape(
+            geometry: lid,
+            options: [
+                .type: SCNPhysicsShape.ShapeType.convexHull,
+                .collisionMargin: PhysicsMetrics.collisionMargin
+            ]
+        )
+        let body = SCNPhysicsBody(type: .kinematic, shape: shape)
+        body.categoryBitMask = PhysicsCategory.container
+        body.collisionBitMask = PhysicsCategory.pill
+        body.contactTestBitMask = 0
+        body.friction = 0.92
         body.restitution = 0.04
         node.physicsBody = body
         node.geometry = nil
@@ -1026,7 +1068,7 @@ enum BottleSceneFactory {
         let body = SCNPhysicsBody(type: .dynamic, shape: shape)
         body.mass = 0.012
         body.isAffectedByGravity = false
-        body.continuousCollisionDetectionThreshold = 0
+        body.continuousCollisionDetectionThreshold = PhysicsMetrics.continuousCollisionDetectionThreshold
         body.friction = 0.72
         body.rollingFriction = 0.18
         body.restitution = 0.04
