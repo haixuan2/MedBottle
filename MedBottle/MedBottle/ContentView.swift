@@ -397,7 +397,6 @@ struct MedicationDetailScreen: View {
 
                         MedicationStockCard(
                             status: snapshot.stockStatus,
-                            doseMetric: doseMetric(from: snapshot),
                             tint: Color(hex: snapshot.hero.bottleColorHex),
                             isHighlighted: remainingHighlight,
                             refillAction: {
@@ -508,10 +507,6 @@ struct MedicationDetailScreen: View {
 
     private func lastTakenMetric(from snapshot: MedicationDetailSnapshot) -> MedicationDetailMetric? {
         snapshot.metrics.first { $0.kind == .lastTaken }
-    }
-
-    private func doseMetric(from snapshot: MedicationDetailSnapshot) -> MedicationDetailMetric? {
-        snapshot.metrics.first { $0.kind == .dose }
     }
 
     private func historyMetric(from snapshot: MedicationDetailSnapshot) -> MedicationDetailMetric? {
@@ -1063,9 +1058,8 @@ private struct MedicationLastTakenCard: View {
     }
 }
 
-private struct MedicationStockCard: View {
+struct MedicationStockCard: View {
     let status: MedicationStockStatus
-    let doseMetric: MedicationDetailMetric?
     let tint: Color
     let isHighlighted: Bool
     var refillAction: () -> Void
@@ -1074,7 +1068,7 @@ private struct MedicationStockCard: View {
         Button(action: refillAction) {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 8) {
-                    Label("Doses Available", systemImage: statusIcon)
+                    Label(titleText, systemImage: statusIcon)
                         .font(.system(size: 13, weight: .bold, design: .rounded))
                         .foregroundStyle(statusAccent)
                         .lineLimit(1)
@@ -1099,27 +1093,11 @@ private struct MedicationStockCard: View {
                         .minimumScaleFactor(0.78)
                 }
 
-                HStack(alignment: .firstTextBaseline, spacing: 10) {
-                    Text(doseInstructionText)
-                        .font(.system(size: 13, weight: .semibold, design: .rounded))
-                        .foregroundStyle(AppTheme.primaryText)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.82)
-
-                    Text(availableDoseText)
-                        .font(.system(size: 13, weight: .bold, design: .rounded))
-                        .foregroundStyle(statusAccent)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.82)
-
-                    if let stockGuidanceText {
-                        Text(stockGuidanceText)
-                            .font(.system(size: 13, weight: .medium, design: .rounded))
-                            .foregroundStyle(AppTheme.secondaryText)
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.82)
-                    }
-                }
+                Text(messageText)
+                    .font(.system(size: 13, weight: .medium, design: .rounded))
+                    .foregroundStyle(AppTheme.secondaryText)
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.82)
             }
             .padding(16)
             .frame(maxWidth: .infinity, minHeight: 128, alignment: .leading)
@@ -1132,12 +1110,24 @@ private struct MedicationStockCard: View {
         }
         .buttonStyle(.plain)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(accessibilityLabel)
+        .accessibilityLabel(accessibilitySummary)
         .accessibilityHint("Opens refill options for this medication.")
     }
 
-    private var tabletLabel: String {
+    var titleText: String {
+        status.title
+    }
+
+    var messageText: String {
+        status.message
+    }
+
+    var tabletLabel: String {
         status.remainingCount == 1 ? "tablet" : "tablets"
+    }
+
+    var accessibilitySummary: String {
+        "Remaining, \(status.remainingCount) \(tabletLabel). \(titleText). \(messageText)"
     }
 
     private var refillIndicator: some View {
@@ -1152,52 +1142,6 @@ private struct MedicationStockCard: View {
         .padding(.horizontal, 9)
         .frame(height: 26)
         .background(statusAccent.opacity(0.11), in: Capsule())
-    }
-
-    private var availableDoseText: String {
-        switch status.remainingDoses {
-        case 0:
-            return "No full doses"
-        case 1:
-            return "1 full dose"
-        default:
-            return "\(status.remainingDoses) full doses"
-        }
-    }
-
-    private var doseInstructionText: String {
-        guard let doseMetric else {
-            return "Dose details unavailable"
-        }
-
-        if let subtitle = doseMetric.subtitle {
-            if doseMetric.value == "1", subtitle == "tablets per dose" {
-                return "1 tablet per dose"
-            }
-
-            return "\(doseMetric.value) \(subtitle)"
-        }
-
-        return doseMetric.value
-    }
-
-    private var stockGuidanceText: String? {
-        switch status.level {
-        case .ready:
-            return nil
-        case .low, .empty:
-            return status.message
-        }
-    }
-
-    private var accessibilityLabel: String {
-        let baseLabel = "Doses available, \(status.remainingCount) \(tabletLabel), \(availableDoseText). \(doseInstructionText)."
-
-        guard let stockGuidanceText else {
-            return baseLabel
-        }
-
-        return "\(baseLabel) \(stockGuidanceText)"
     }
 
     private var statusIcon: String {

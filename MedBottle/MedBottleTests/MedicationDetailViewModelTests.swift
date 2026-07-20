@@ -1,10 +1,63 @@
 import Combine
 import SwiftData
+import SwiftUI
 import XCTest
 @testable import MedBottle
 
 @MainActor
 final class MedicationDetailViewModelTests: XCTestCase {
+    func testStockCardRestoresStatusTitleMessageAndAccessibilitySummary() {
+        let scenarios: [(MedicationStockStatus, String)] = [
+            (
+                MedicationStockStatus(
+                    level: .ready,
+                    title: "On hand",
+                    message: "5 full doses available.",
+                    remainingCount: 10,
+                    remainingDoses: 5
+                ),
+                "tablets"
+            ),
+            (
+                MedicationStockStatus(
+                    level: .low,
+                    title: "Low stock",
+                    message: "1 full dose left.",
+                    remainingCount: 1,
+                    remainingDoses: 1
+                ),
+                "tablet"
+            ),
+            (
+                MedicationStockStatus(
+                    level: .empty,
+                    title: "Empty",
+                    message: "Refill this bottle before the next dose.",
+                    remainingCount: 0,
+                    remainingDoses: 0
+                ),
+                "tablets"
+            )
+        ]
+
+        for (status, expectedTabletLabel) in scenarios {
+            let card = MedicationStockCard(
+                status: status,
+                tint: .blue,
+                isHighlighted: false,
+                refillAction: {}
+            )
+
+            XCTAssertEqual(card.titleText, status.title)
+            XCTAssertEqual(card.messageText, status.message)
+            XCTAssertEqual(card.tabletLabel, expectedTabletLabel)
+            XCTAssertEqual(
+                card.accessibilitySummary,
+                "Remaining, \(status.remainingCount) \(expectedTabletLabel). \(status.title). \(status.message)"
+            )
+        }
+    }
+
     func testBottleMotionPolicyDisablesAutomaticMotionForReducedMotion() {
         XCTAssertFalse(BottleSceneMotionPolicy.shouldAutoPlay(reduceMotion: true))
         XCTAssertFalse(BottleSceneMotionPolicy.shouldAnimateInventoryChange(reduceMotion: true))
