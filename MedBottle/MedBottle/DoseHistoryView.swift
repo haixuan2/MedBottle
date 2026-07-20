@@ -58,6 +58,7 @@ struct DoseHistoryView: View {
                     .frame(width: 38, height: 38)
                     .background(AppTheme.controlSurface, in: Circle())
             }
+            .buttonStyle(.plain)
             .accessibilityLabel("Previous month")
 
             Spacer()
@@ -75,6 +76,7 @@ struct DoseHistoryView: View {
                     .frame(width: 38, height: 38)
                     .background(AppTheme.controlSurface, in: Circle())
             }
+            .buttonStyle(.plain)
             .accessibilityLabel("Next month")
         }
     }

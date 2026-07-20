@@ -397,6 +397,7 @@ struct MedicationDetailScreen: View {
 
                         MedicationStockCard(
                             status: snapshot.stockStatus,
+                            doseMetric: doseMetric(from: snapshot),
                             tint: Color(hex: snapshot.hero.bottleColorHex),
                             isHighlighted: remainingHighlight,
                             refillAction: {
@@ -408,12 +409,11 @@ struct MedicationDetailScreen: View {
                             MedicationLastTakenCard(metric: lastTakenMetric)
                         }
 
-                        MedicationMetricsGrid(metrics: secondaryMetrics(from: snapshot))
-
                         MedicationReminderCard(overview: snapshot.reminderOverview)
 
                         RecentDoseRecordsCard(
                             records: snapshot.recentDoseRecords,
+                            historyMetric: historyMetric(from: snapshot),
                             onShowHistory: onShowHistory,
                             onAddManualDose: {
                                 manualDoseMedication = snapshot.medication
@@ -506,14 +506,16 @@ struct MedicationDetailScreen: View {
         }
     }
 
-    private func secondaryMetrics(from snapshot: MedicationDetailSnapshot) -> [MedicationDetailMetric] {
-        snapshot.metrics.filter { metric in
-            metric.kind != .remaining && metric.kind != .lastTaken
-        }
-    }
-
     private func lastTakenMetric(from snapshot: MedicationDetailSnapshot) -> MedicationDetailMetric? {
         snapshot.metrics.first { $0.kind == .lastTaken }
+    }
+
+    private func doseMetric(from snapshot: MedicationDetailSnapshot) -> MedicationDetailMetric? {
+        snapshot.metrics.first { $0.kind == .dose }
+    }
+
+    private func historyMetric(from snapshot: MedicationDetailSnapshot) -> MedicationDetailMetric? {
+        snapshot.metrics.first { $0.kind == .doseHistory }
     }
 
     private func bottleSceneHeight(for geometry: GeometryProxy) -> CGFloat {
@@ -1015,23 +1017,6 @@ private struct MedicationDetailHeroSection: View {
     }
 }
 
-private struct MedicationMetricsGrid: View {
-    let metrics: [MedicationDetailMetric]
-
-    private let columns = [
-        GridItem(.flexible(), spacing: 8),
-        GridItem(.flexible(), spacing: 8)
-    ]
-
-    var body: some View {
-        LazyVGrid(columns: columns, spacing: 8) {
-            ForEach(metrics) { metric in
-                MedicationMetricCard(metric: metric)
-            }
-        }
-    }
-}
-
 private struct MedicationLastTakenCard: View {
     let metric: MedicationDetailMetric
 
@@ -1080,55 +1065,61 @@ private struct MedicationLastTakenCard: View {
 
 private struct MedicationStockCard: View {
     let status: MedicationStockStatus
+    let doseMetric: MedicationDetailMetric?
     let tint: Color
     let isHighlighted: Bool
     var refillAction: () -> Void
 
     var body: some View {
         Button(action: refillAction) {
-            HStack(alignment: .center, spacing: 14) {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack(spacing: 8) {
-                        Label(statusTitle, systemImage: statusIcon)
-                            .font(.system(size: 13, weight: .bold, design: .rounded))
-                            .foregroundStyle(statusAccent)
-                            .lineLimit(1)
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    Label("Doses Available", systemImage: statusIcon)
+                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                        .foregroundStyle(statusAccent)
+                        .lineLimit(1)
 
-                        Spacer(minLength: 8)
+                    Spacer(minLength: 8)
 
-                        Label("Refill", systemImage: "arrow.triangle.2.circlepath")
-                            .font(.system(size: 12, weight: .bold, design: .rounded))
-                            .foregroundStyle(statusAccent)
-                            .lineLimit(1)
-                    }
-
-                    HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Text("\(status.remainingCount)")
-                            .font(.system(size: 44, weight: .bold, design: .rounded))
-                            .foregroundStyle(AppTheme.primaryText)
-                            .contentTransition(.numericText())
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.58)
-
-                        Text(tabletLabel)
-                            .font(.system(size: 15, weight: .semibold, design: .rounded))
-                            .foregroundStyle(AppTheme.secondaryText)
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.78)
-                    }
-
-                    Text(status.message)
-                        .font(.system(size: 13, weight: .medium, design: .rounded))
-                        .foregroundStyle(AppTheme.secondaryText)
-                        .lineLimit(2)
-                        .minimumScaleFactor(0.82)
+                    refillIndicator
                 }
 
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 14, weight: .bold))
-                    .foregroundStyle(statusAccent.opacity(0.82))
-                    .frame(width: 30, height: 30)
-                    .background(statusAccent.opacity(0.11), in: Circle())
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text("\(status.remainingCount)")
+                        .font(.system(size: 44, weight: .bold, design: .rounded))
+                        .foregroundStyle(AppTheme.primaryText)
+                        .contentTransition(.numericText())
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.58)
+
+                    Text(tabletLabel)
+                        .font(.system(size: 15, weight: .semibold, design: .rounded))
+                        .foregroundStyle(AppTheme.secondaryText)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.78)
+                }
+
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    Text(doseInstructionText)
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                        .foregroundStyle(AppTheme.primaryText)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.82)
+
+                    Text(availableDoseText)
+                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                        .foregroundStyle(statusAccent)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.82)
+
+                    if let stockGuidanceText {
+                        Text(stockGuidanceText)
+                            .font(.system(size: 13, weight: .medium, design: .rounded))
+                            .foregroundStyle(AppTheme.secondaryText)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.82)
+                    }
+                }
             }
             .padding(16)
             .frame(maxWidth: .infinity, minHeight: 128, alignment: .leading)
@@ -1141,7 +1132,7 @@ private struct MedicationStockCard: View {
         }
         .buttonStyle(.plain)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Remaining, \(status.remainingCount) \(tabletLabel). \(statusTitle). \(status.message)")
+        .accessibilityLabel(accessibilityLabel)
         .accessibilityHint("Opens refill options for this medication.")
     }
 
@@ -1149,15 +1140,64 @@ private struct MedicationStockCard: View {
         status.remainingCount == 1 ? "tablet" : "tablets"
     }
 
-    private var statusTitle: String {
+    private var refillIndicator: some View {
+        HStack(spacing: 5) {
+            Text("Refill")
+            Image(systemName: "chevron.right")
+                .font(.system(size: 10, weight: .heavy))
+        }
+        .font(.system(size: 12, weight: .bold, design: .rounded))
+        .foregroundStyle(statusAccent)
+        .lineLimit(1)
+        .padding(.horizontal, 9)
+        .frame(height: 26)
+        .background(statusAccent.opacity(0.11), in: Capsule())
+    }
+
+    private var availableDoseText: String {
+        switch status.remainingDoses {
+        case 0:
+            return "No full doses"
+        case 1:
+            return "1 full dose"
+        default:
+            return "\(status.remainingDoses) full doses"
+        }
+    }
+
+    private var doseInstructionText: String {
+        guard let doseMetric else {
+            return "Dose details unavailable"
+        }
+
+        if let subtitle = doseMetric.subtitle {
+            if doseMetric.value == "1", subtitle == "tablets per dose" {
+                return "1 tablet per dose"
+            }
+
+            return "\(doseMetric.value) \(subtitle)"
+        }
+
+        return doseMetric.value
+    }
+
+    private var stockGuidanceText: String? {
         switch status.level {
         case .ready:
-            return "On hand"
-        case .low:
-            return "Low stock"
-        case .empty:
-            return "Empty"
+            return nil
+        case .low, .empty:
+            return status.message
         }
+    }
+
+    private var accessibilityLabel: String {
+        let baseLabel = "Doses available, \(status.remainingCount) \(tabletLabel), \(availableDoseText). \(doseInstructionText)."
+
+        guard let stockGuidanceText else {
+            return baseLabel
+        }
+
+        return "\(baseLabel) \(stockGuidanceText)"
     }
 
     private var statusIcon: String {
@@ -1200,37 +1240,6 @@ private struct MedicationStockCard: View {
         case .low, .empty:
             return AppTheme.surfaceStrong
         }
-    }
-}
-
-private struct MedicationMetricCard: View {
-    let metric: MedicationDetailMetric
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(metric.title)
-                .font(.system(size: 12, weight: .semibold, design: .rounded))
-                .foregroundStyle(AppTheme.secondaryText)
-                .lineLimit(1)
-
-            Text(metric.value)
-                .font(.system(size: metric.kind == .lastTaken ? 17 : 21, weight: .bold, design: .rounded))
-                .foregroundStyle(AppTheme.primaryText)
-                .lineLimit(1)
-                .minimumScaleFactor(0.62)
-
-            if let subtitle = metric.subtitle {
-                Text(subtitle)
-                    .font(.system(size: 12, weight: .medium, design: .rounded))
-                    .foregroundStyle(AppTheme.secondaryText)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
-            }
-        }
-        .padding(10)
-        .frame(maxWidth: .infinity, minHeight: 84, maxHeight: 84, alignment: .leading)
-        .background(AppTheme.surface, in: RoundedRectangle(cornerRadius: 8))
-        .accessibilityElement(children: .combine)
     }
 }
 
@@ -1301,15 +1310,24 @@ private struct MedicationReminderCard: View {
 
 private struct RecentDoseRecordsCard: View {
     let records: [DoseRecord]
+    let historyMetric: MedicationDetailMetric?
     var onShowHistory: () -> Void
     var onAddManualDose: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 8) {
-                Text("Recent doses")
-                    .font(.system(size: 18, weight: .bold, design: .rounded))
-                    .foregroundStyle(AppTheme.primaryText)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Dose History")
+                        .font(.system(size: 18, weight: .bold, design: .rounded))
+                        .foregroundStyle(AppTheme.primaryText)
+
+                    Text(historySummaryText)
+                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .foregroundStyle(AppTheme.secondaryText)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.82)
+                }
 
                 Spacer()
 
@@ -1354,6 +1372,19 @@ private struct RecentDoseRecordsCard: View {
         }
         .padding(14)
         .background(AppTheme.surface, in: RoundedRectangle(cornerRadius: 8))
+        .accessibilityElement(children: .contain)
+    }
+
+    private var historySummaryText: String {
+        guard let historyMetric else {
+            return records.isEmpty ? "No logged doses yet" : "\(records.count) recent doses"
+        }
+
+        if let subtitle = historyMetric.subtitle {
+            return "\(historyMetric.value) \(subtitle)"
+        }
+
+        return "\(historyMetric.value) logged doses"
     }
 }
 
