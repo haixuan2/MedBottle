@@ -93,11 +93,18 @@ extension UIColor {
 
         getRed(&red, green: &green, blue: &blue, alpha: &alpha)
 
+        // Round rather than truncate: converting a SwiftUI Color to UIColor can land a
+        // hair under the exact component, and truncating would drop the color a step
+        // darker on every save. Clamp because extended sRGB allows values outside 0...1.
+        func byte(_ component: CGFloat) -> Int {
+            Int(min(max((component * 255).rounded(), 0), 255))
+        }
+
         return String(
             format: "%02X%02X%02X",
-            Int(red * 255),
-            Int(green * 255),
-            Int(blue * 255)
+            byte(red),
+            byte(green),
+            byte(blue)
         )
     }
 }

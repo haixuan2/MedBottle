@@ -21,6 +21,7 @@
 		8B3F3A412C20100100100001 /* MedicationDetailViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B3F3A402C20100100100001 /* MedicationDetailViewModel.swift */; };
 		8B3F3A502C20100100100001 /* MedicationDetailViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B3F3A532C20100100100001 /* MedicationDetailViewModelTests.swift */; };
 		8B3F3A652C20100100100001 /* BottleScenePhysicsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B3F3A662C20100100100001 /* BottleScenePhysicsTests.swift */; };
+		8B3F3A712C20100100100001 /* ColorHexTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B3F3A722C20100100100001 /* ColorHexTests.swift */; };
 		8B3F3A612C20100100100001 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 8B3F3A602C20100100100001 /* Assets.xcassets */; };
 		8B3F3A642C20100100100001 /* studio_lighting.hdr in Resources */ = {isa = PBXBuildFile; fileRef = 8B3F3A632C20100100100001 /* studio_lighting.hdr */; };
 /* End PBXBuildFile section */
@@ -53,6 +54,7 @@
 		8B3F3A522C20100100100001 /* MedBottleTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = MedBottleTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		8B3F3A532C20100100100001 /* MedicationDetailViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MedicationDetailViewModelTests.swift; sourceTree = "<group>"; };
 		8B3F3A662C20100100100001 /* BottleScenePhysicsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BottleScenePhysicsTests.swift; sourceTree = "<group>"; };
+		8B3F3A722C20100100100001 /* ColorHexTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ColorHexTests.swift; sourceTree = "<group>"; };
 		8B3F3A602C20100100100001 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		8B3F3A632C20100100100001 /* studio_lighting.hdr */ = {isa = PBXFileReference; lastKnownFileType = file; path = studio_lighting.hdr; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -127,6 +129,7 @@
 			isa = PBXGroup;
 			children = (
 				8B3F3A662C20100100100001 /* BottleScenePhysicsTests.swift */,
+				8B3F3A722C20100100100001 /* ColorHexTests.swift */,
 				8B3F3A532C20100100100001 /* MedicationDetailViewModelTests.swift */,
 			);
 			path = MedBottleTests;
@@ -252,6 +255,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				8B3F3A652C20100100100001 /* BottleScenePhysicsTests.swift in Sources */,
+				8B3F3A712C20100100100001 /* ColorHexTests.swift in Sources */,
 				8B3F3A502C20100100100001 /* MedicationDetailViewModelTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
