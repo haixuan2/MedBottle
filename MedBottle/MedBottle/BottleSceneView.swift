@@ -239,25 +239,32 @@ enum BottleSceneFactory {
         static let floorTop: Float = -1.475
         static let lidBottom: Float = 1.389
         static let boundaryThickness: CGFloat = 0.02
+        static let floorCollisionDepth: CGFloat = 0.20
         static let wallHeight = CGFloat(lidBottom - floorTop)
         static let wallCenterY = (floorTop + lidBottom) / 2
         static let wallSegmentCount = 16
 
         static let floorRadius: CGFloat = 0.62
-        static let floorCenterY = floorTop - Float(boundaryThickness / 2)
+        static let floorCenterY = floorTop - Float(floorCollisionDepth / 2)
         static let lidCenterY = lidBottom + Float(boundaryThickness / 2)
         static let envelopePosition = SCNVector3(0, -0.08, 0)
 
-        static let spawnColumns = 6
-        static let spawnRingRadius: Float = 0.30
-        static let spawnStartY: Float = -0.48
-        static let spawnLayerSpacing: Float = 0.20
+        static let visiblePillLimit = 90
+
+        static let roundSpawnCoordinates: [Float] = [-0.28, 0, 0.28]
+        static let roundSpawnStartY: Float = -1.327
+        static let roundSpawnLayerSpacing: Float = 0.28
+
+        static let capsuleSpawnXCoordinates: [Float] = [-0.21, 0.21]
+        static let capsuleSpawnZCoordinates: [Float] = [-0.30, -0.10, 0.10, 0.30]
+        static let capsuleSpawnStartY: Float = -1.365
+        static let capsuleSpawnLayerSpacing: Float = 0.24
 
         static let spinImpulseScale: Float = 0.07
         static let maxSpinImpulse: Float = 0.055
 
         static let collisionMargin: CGFloat = 0.001
-        static let continuousCollisionDetectionThreshold: CGFloat = 0.044
+        static let continuousCollisionDetectionThreshold: CGFloat = 0.010
     }
 
     private enum LabelMetrics {
@@ -343,10 +350,17 @@ enum BottleSceneFactory {
         label.position = SCNVector3(0, 0.18, 0)
         bottle.addChildNode(label)
 
-        assembly.addChildNode(collisionEnvelopeNode())
+        let collisionEnvelope = collisionEnvelopeNode()
+        assembly.addChildNode(collisionEnvelope)
 
-        let tablets = tabletsNode(count: medication.tabletsRemaining, shape: medication.medicationShape)
+        let tablets = tabletsNode(shape: medication.medicationShape)
         assembly.addChildNode(tablets)
+        reconcileTabletCount(
+            in: tablets,
+            count: medication.tabletsRemaining,
+            shape: medication.medicationShape,
+            animated: false
+        )
 
         update(scene: scene, medication: medication, colorScheme: colorScheme, reduceMotion: reduceMotion)
         return scene
@@ -376,8 +390,14 @@ enum BottleSceneFactory {
         if let tablets = tabletGroup(in: assembly) {
             if tablets.name != tabletGroupName(shape: medication.medicationShape) {
                 tablets.removeFromParentNode()
-                let newTablets = tabletsNode(count: medication.tabletsRemaining, shape: medication.medicationShape)
+                let newTablets = tabletsNode(shape: medication.medicationShape)
                 assembly.addChildNode(newTablets)
+                reconcileTabletCount(
+                    in: newTablets,
+                    count: medication.tabletsRemaining,
+                    shape: medication.medicationShape,
+                    animated: false
+                )
             } else {
                 reconcileTabletCount(
                     in: tablets,
@@ -818,7 +838,7 @@ enum BottleSceneFactory {
     }
 
     private static func collisionFloorNode() -> SCNNode {
-        let floor = SCNCylinder(radius: PhysicsMetrics.floorRadius, height: PhysicsMetrics.boundaryThickness)
+        let floor = SCNCylinder(radius: PhysicsMetrics.floorRadius, height: PhysicsMetrics.floorCollisionDepth)
         floor.radialSegmentCount = 96
         floor.materials = [invisibleCollisionMaterial()]
 
@@ -950,22 +970,14 @@ enum BottleSceneFactory {
         node.geometry?.firstMaterial = invisibleCollisionMaterial()
     }
 
-    private static func tabletsNode(count: Int, shape: MedicationShape) -> SCNNode {
+    private static func tabletsNode(shape: MedicationShape) -> SCNNode {
         let group = SCNNode()
         group.name = tabletGroupName(shape: shape)
-
-        let visibleCount = min(count, 18)
-        guard visibleCount > 0 else { return group }
-
-        for index in 0..<visibleCount {
-            group.addChildNode(tabletNode(shape: shape, index: index, visibleCount: visibleCount))
-        }
-
         return group
     }
 
     private static func reconcileTabletCount(in group: SCNNode, count: Int, shape: MedicationShape, animated: Bool) {
-        let targetCount = min(count, 18)
+        let targetCount = min(max(count, 0), PhysicsMetrics.visiblePillLimit)
         let activePills = group.childNodes.filter { $0.name == NodeName.pill }
 
         if activePills.count > targetCount {
@@ -975,7 +987,7 @@ enum BottleSceneFactory {
             }
         } else if activePills.count < targetCount {
             for index in activePills.count..<targetCount {
-                group.addChildNode(tabletNode(shape: shape, index: index, visibleCount: targetCount, enters: animated))
+                group.addChildNode(tabletNode(shape: shape, index: index, in: group, enters: animated))
             }
         }
     }
@@ -996,7 +1008,7 @@ enum BottleSceneFactory {
         node.runAction(.sequence([.group([fade, shrink]), .removeFromParentNode()]))
     }
 
-    private static func tabletNode(shape: MedicationShape, index: Int, visibleCount: Int, enters: Bool = false) -> SCNNode {
+    private static func tabletNode(shape: MedicationShape, index: Int, in group: SCNNode, enters: Bool = false) -> SCNNode {
         let tablet = tabletGeometry(for: shape)
         let material = SCNMaterial()
         material.diffuse.contents = tabletColor(for: shape, index: index)
@@ -1009,8 +1021,8 @@ enum BottleSceneFactory {
         let node = SCNNode(geometry: tablet)
         node.name = NodeName.pill
         node.renderingOrder = RenderOrder.pills
-        node.position = pillSpawnPosition(index: index)
-        node.eulerAngles = pillSpawnRotation(shape: shape, index: index)
+        node.position = pillSpawnPosition(shape: shape, index: index, in: group)
+        node.eulerAngles = pillSpawnRotation(shape: shape)
         node.physicsBody = pillPhysicsBody(for: tablet)
         node.physicsBody?.isAffectedByGravity = true
         node.castsShadow = true
@@ -1028,32 +1040,42 @@ enum BottleSceneFactory {
         return node
     }
 
-    private static func pillSpawnPosition(index: Int) -> SCNVector3 {
-        let layer = index / PhysicsMetrics.spawnColumns
-        let slot = index % PhysicsMetrics.spawnColumns
-        let angleStep = (Float.pi * 2) / Float(PhysicsMetrics.spawnColumns)
-        let stagger = layer.isMultiple(of: 2) ? Float(0) : angleStep / 2
-        let angle = Float(slot) * angleStep + stagger
-        let y = PhysicsMetrics.spawnStartY + Float(layer) * PhysicsMetrics.spawnLayerSpacing
+    private static func pillSpawnPosition(shape: MedicationShape, index: Int, in group: SCNNode) -> SCNVector3 {
+        let envelopePosition: SCNVector3
 
-        return SCNVector3(
-            cos(angle) * PhysicsMetrics.spawnRingRadius,
-            y,
-            sin(angle) * PhysicsMetrics.spawnRingRadius
-        )
+        if shape == .capsule {
+            let slotsPerLayer = PhysicsMetrics.capsuleSpawnXCoordinates.count * PhysicsMetrics.capsuleSpawnZCoordinates.count
+            let slot = index % slotsPerLayer
+            let layer = index / slotsPerLayer
+            envelopePosition = SCNVector3(
+                PhysicsMetrics.capsuleSpawnXCoordinates[slot % PhysicsMetrics.capsuleSpawnXCoordinates.count],
+                PhysicsMetrics.capsuleSpawnStartY + Float(layer) * PhysicsMetrics.capsuleSpawnLayerSpacing,
+                PhysicsMetrics.capsuleSpawnZCoordinates[slot / PhysicsMetrics.capsuleSpawnXCoordinates.count]
+            )
+        } else {
+            let slotsPerLayer = PhysicsMetrics.roundSpawnCoordinates.count * PhysicsMetrics.roundSpawnCoordinates.count
+            let slot = index % slotsPerLayer
+            let layer = index / slotsPerLayer
+            envelopePosition = SCNVector3(
+                PhysicsMetrics.roundSpawnCoordinates[slot % PhysicsMetrics.roundSpawnCoordinates.count],
+                PhysicsMetrics.roundSpawnStartY + Float(layer) * PhysicsMetrics.roundSpawnLayerSpacing,
+                PhysicsMetrics.roundSpawnCoordinates[slot / PhysicsMetrics.roundSpawnCoordinates.count]
+            )
+        }
+
+        guard
+            let assembly = group.parent,
+            let envelope = assembly.childNode(withName: NodeName.collisionEnvelope, recursively: false)
+        else { return envelopePosition }
+        return group.convertPosition(envelopePosition, from: envelope)
     }
 
-    private static func pillSpawnRotation(shape: MedicationShape, index: Int) -> SCNVector3 {
-        let yaw = (Float(index) * 0.73).truncatingRemainder(dividingBy: Float.pi * 2)
-        let smallTilt = Float(index % 5) * 0.035
-
+    private static func pillSpawnRotation(shape: MedicationShape) -> SCNVector3 {
         switch shape {
         case .capsule:
-            return SCNVector3(0.12 + smallTilt, yaw, Float.pi / 2)
-        case .tablet:
-            return SCNVector3(0.10 + smallTilt, yaw, 0.08)
-        case .pill, .softgel:
-            return SCNVector3(smallTilt, yaw, smallTilt * 0.5)
+            return SCNVector3(0, 0, Float.pi / 2)
+        case .tablet, .pill, .softgel:
+            return SCNVector3Zero
         }
     }
 

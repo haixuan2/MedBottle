@@ -16,10 +16,14 @@ final class BottleScenePhysicsTests: XCTestCase {
         static let envelopeY: Float = -0.08
         static let innerRadius: Float = 0.620
         static let floorTop: Float = -1.475
+        static let floorCollisionDepth: Float = 0.20
         static let lidBottom: Float = 1.389
         static let tolerance: Float = 0.020
-        static let ccdThreshold: CGFloat = 0.044
+        static let ccdThreshold: CGFloat = 0.010
         static let maxPillSpeed: Float = 2.4
+        static let roundProxyRadius: Float = 0.128
+        static let capsuleProxyRadius: Float = 0.09
+        static let capsuleProxyHalfSegment: Float = 0.09
 
         static let pillCategory = 1 << 0
         static let containerCategory = 1 << 1
@@ -41,7 +45,7 @@ final class BottleScenePhysicsTests: XCTestCase {
         let walls = try XCTUnwrap(envelope.childNode(withName: Contract.wallsName, recursively: false))
         let lid = try XCTUnwrap(envelope.childNode(withName: Contract.lidName, recursively: false))
 
-        XCTAssertEqual(floor.position.y, Contract.floorTop - 0.01, accuracy: 0.0001)
+        XCTAssertEqual(floor.position.y, Contract.floorTop - Contract.floorCollisionDepth / 2, accuracy: 0.0001)
         XCTAssertEqual(lid.position.y, Contract.lidBottom + 0.01, accuracy: 0.0001)
         XCTAssertEqual(walls.childNodes.count, 16)
 
@@ -55,12 +59,14 @@ final class BottleScenePhysicsTests: XCTestCase {
 
     func testEveryPillUsesContinuousCollisionDetection() throws {
         for shape in MedicationShape.allCases {
-            let scene = makeScene(shape: shape, inventory: 18)
+            let scene = makeScene(shape: shape, inventory: 90)
             let pills = try activePills(in: scene)
 
-            XCTAssertEqual(pills.count, 18, "Unexpected pill count for \(shape.rawValue)")
+            XCTAssertEqual(pills.count, 90, "Unexpected pill count for \(shape.rawValue)")
             for pill in pills {
                 let body = try XCTUnwrap(pill.physicsBody)
+                XCTAssertEqual(body.type, .dynamic)
+                XCTAssertTrue(body.isAffectedByGravity)
                 XCTAssertEqual(body.continuousCollisionDetectionThreshold, Contract.ccdThreshold, accuracy: 0.0001)
                 XCTAssertEqual(body.categoryBitMask, Contract.pillCategory)
                 XCTAssertEqual(body.collisionBitMask, Contract.pillCategory | Contract.containerCategory)
@@ -68,9 +74,96 @@ final class BottleScenePhysicsTests: XCTestCase {
         }
     }
 
+    func testDisplayedPillCountClampsAtNinetyForEveryShape() throws {
+        for shape in MedicationShape.allCases {
+            for (inventory, expectedCount) in [(0, 0), (18, 18), (30, 30), (90, 90), (91, 90)] {
+                let scene = makeScene(shape: shape, inventory: inventory)
+                XCTAssertEqual(
+                    try activePills(in: scene).count,
+                    expectedCount,
+                    "Unexpected displayed count for \(shape.rawValue), inventory=\(inventory)"
+                )
+            }
+        }
+    }
+
+    func testNinetyPillsStartFullyInsideEnvelopeWithoutProxyOverlap() throws {
+        for shape in MedicationShape.allCases {
+            let scene = makeScene(shape: shape, inventory: 90)
+            let assembly = try XCTUnwrap(scene.rootNode.childNode(withName: "assembly", recursively: false))
+            let envelope = try XCTUnwrap(assembly.childNode(withName: Contract.envelopeName, recursively: false))
+            let pills = try activePills(in: scene)
+
+            for pill in pills {
+                let bounds = pill.boundingBox
+                for x in [bounds.min.x, bounds.max.x] {
+                    for y in [bounds.min.y, bounds.max.y] {
+                        for z in [bounds.min.z, bounds.max.z] {
+                            let corner = envelope.convertPosition(SCNVector3(x, y, z), from: pill)
+                            XCTAssertLessThanOrEqual(
+                                hypot(corner.x, corner.z),
+                                Contract.innerRadius - Contract.tolerance + 0.0001,
+                                "Spawn corner exceeds radial inset for \(shape.rawValue)"
+                            )
+                            XCTAssertGreaterThanOrEqual(
+                                corner.y,
+                                Contract.floorTop + Contract.tolerance - 0.0001,
+                                "Spawn corner exceeds floor inset for \(shape.rawValue)"
+                            )
+                            XCTAssertLessThanOrEqual(
+                                corner.y,
+                                Contract.lidBottom - Contract.tolerance + 0.0001,
+                                "Spawn corner exceeds lid inset for \(shape.rawValue)"
+                            )
+                        }
+                    }
+                }
+            }
+
+            if shape == .capsule {
+                assertCapsuleProxiesDoNotOverlap(pills, envelope: envelope)
+            } else {
+                assertRoundProxiesDoNotOverlap(pills, envelope: envelope, shape: shape)
+            }
+        }
+    }
+
+    func testInventoryReconciliationAddsAndRemovesExactActivePillCounts() throws {
+        for shape in MedicationShape.allCases {
+            let decrementScene = makeScene(shape: shape, inventory: 90)
+            BottleSceneFactory.update(
+                scene: decrementScene,
+                medication: makeMedication(shape: shape, inventory: 89),
+                colorScheme: .light,
+                reduceMotion: true
+            )
+            XCTAssertEqual(try activePills(in: decrementScene).count, 89)
+            XCTAssertTrue(decrementScene.rootNode.childNodes(passingTest: { node, _ in
+                node.name == "pillRemoving"
+            }).isEmpty)
+
+            let refillScene = makeScene(shape: shape, inventory: 30)
+            BottleSceneFactory.update(
+                scene: refillScene,
+                medication: makeMedication(shape: shape, inventory: 90),
+                colorScheme: .light,
+                reduceMotion: true
+            )
+            XCTAssertEqual(try activePills(in: refillScene).count, 90)
+
+            BottleSceneFactory.update(
+                scene: refillScene,
+                medication: makeMedication(shape: shape, inventory: 0),
+                colorScheme: .light,
+                reduceMotion: true
+            )
+            XCTAssertTrue(try activePills(in: refillScene).isEmpty)
+        }
+    }
+
     func testFastAlternatingRotationKeepsEveryPillInsideEnvelope() throws {
         for shape in MedicationShape.allCases {
-            for inventory in [1, 18] {
+            for inventory in [90] {
                 let scene = makeScene(shape: shape, inventory: inventory)
                 let renderer = SCNRenderer(device: nil, options: nil)
                 renderer.scene = scene
@@ -79,6 +172,17 @@ final class BottleScenePhysicsTests: XCTestCase {
                 var time: TimeInterval = 0
                 var rotation: Float = 0
                 renderer.update(atTime: time)
+
+                for frame in 0..<120 {
+                    time += 1.0 / 60.0
+                    renderer.update(atTime: time)
+
+                    guard assertContainment(
+                        in: scene,
+                        inventory: inventory,
+                        context: "shape=\(shape.rawValue), settleFrame=\(frame)"
+                    ) else { return }
+                }
 
                 for sweepIndex in 0..<10 {
                     let sweepDelta: Float = sweepIndex.isMultiple(of: 2) ? 4.32 : -4.32
@@ -102,16 +206,6 @@ final class BottleScenePhysicsTests: XCTestCase {
                     }
                 }
 
-                for frame in 0..<120 {
-                    time += 1.0 / 60.0
-                    renderer.update(atTime: time)
-
-                    guard assertContainment(
-                        in: scene,
-                        inventory: inventory,
-                        context: "shape=\(shape.rawValue), settleFrame=\(frame)"
-                    ) else { return }
-                }
             }
         }
     }
@@ -148,7 +242,7 @@ final class BottleScenePhysicsTests: XCTestCase {
         }
 
         let pills = tabletGroup.childNodes.filter { $0.name == Contract.pillName }
-        guard pills.count == min(inventory, 18) else {
+        guard pills.count == min(max(inventory, 0), 90) else {
             XCTFail("Active pill count changed to \(pills.count): \(context)")
             return false
         }
@@ -193,7 +287,11 @@ final class BottleScenePhysicsTests: XCTestCase {
             }
             guard localPosition.y >= Contract.floorTop - Contract.tolerance,
                   localPosition.y <= Contract.lidBottom + Contract.tolerance else {
-                XCTFail("Pill vertical center escaped at \(localPosition.y): \(context)")
+                XCTFail(
+                    "Pill vertical center escaped at \(localPosition.y), radial=\(radialDistance), " +
+                    "position=(\(localPosition.x), \(localPosition.y), \(localPosition.z)), " +
+                    "velocity=(\(velocity.x), \(velocity.y), \(velocity.z)): \(context)"
+                )
                 return false
             }
         }
@@ -209,19 +307,75 @@ final class BottleScenePhysicsTests: XCTestCase {
         return tabletGroup.childNodes.filter { $0.name == Contract.pillName }
     }
 
+    private func assertRoundProxiesDoNotOverlap(
+        _ pills: [SCNNode],
+        envelope: SCNNode,
+        shape: MedicationShape
+    ) {
+        let centers = pills.map { envelope.convertPosition(SCNVector3Zero, from: $0) }
+        for first in centers.indices {
+            for second in centers.indices where second > first {
+                let deltaX = centers[first].x - centers[second].x
+                let deltaY = centers[first].y - centers[second].y
+                let deltaZ = centers[first].z - centers[second].z
+                let distanceSquared = deltaX * deltaX + deltaY * deltaY + deltaZ * deltaZ
+                let distance = sqrt(distanceSquared)
+                XCTAssertGreaterThanOrEqual(
+                    distance + 0.0001,
+                    Contract.roundProxyRadius * 2,
+                    "Initial \(shape.rawValue) proxies overlap at \(first), \(second)"
+                )
+            }
+        }
+    }
+
+    private func assertCapsuleProxiesDoNotOverlap(_ pills: [SCNNode], envelope: SCNNode) {
+        let segments = pills.map { pill -> (minX: Float, maxX: Float, y: Float, z: Float) in
+            let first = envelope.convertPosition(
+                SCNVector3(0, -Contract.capsuleProxyHalfSegment, 0),
+                from: pill
+            )
+            let second = envelope.convertPosition(
+                SCNVector3(0, Contract.capsuleProxyHalfSegment, 0),
+                from: pill
+            )
+            XCTAssertEqual(first.y, second.y, accuracy: 0.0001)
+            XCTAssertEqual(first.z, second.z, accuracy: 0.0001)
+            return (min(first.x, second.x), max(first.x, second.x), (first.y + second.y) / 2, (first.z + second.z) / 2)
+        }
+
+        for first in segments.indices {
+            for second in segments.indices where second > first {
+                let xGap = max(0, max(segments[first].minX, segments[second].minX) - min(segments[first].maxX, segments[second].maxX))
+                let yGap = segments[first].y - segments[second].y
+                let zGap = segments[first].z - segments[second].z
+                let distance = sqrt(xGap * xGap + yGap * yGap + zGap * zGap)
+                XCTAssertGreaterThanOrEqual(
+                    distance + 0.0001,
+                    Contract.capsuleProxyRadius * 2,
+                    "Initial capsule proxies overlap at \(first), \(second)"
+                )
+            }
+        }
+    }
+
     private func makeScene(shape: MedicationShape, inventory: Int) -> SCNScene {
         BottleSceneFactory.scene(
-            for: Medication(
-                id: UUID(),
-                name: "Physics Test",
-                tabletsRemaining: inventory,
-                tabletsPerDose: 1,
-                bottleColorHex: "D68A28",
-                medicationShape: shape,
-                lastTakenAt: nil
-            ),
+            for: makeMedication(shape: shape, inventory: inventory),
             colorScheme: .light,
             reduceMotion: false
+        )
+    }
+
+    private func makeMedication(shape: MedicationShape, inventory: Int) -> Medication {
+        Medication(
+            id: UUID(),
+            name: "Physics Test",
+            tabletsRemaining: inventory,
+            tabletsPerDose: 1,
+            bottleColorHex: "D68A28",
+            medicationShape: shape,
+            lastTakenAt: nil
         )
     }
 }
