@@ -4,12 +4,21 @@ struct DoseHistoryView: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var store: MedicationStore
 
-    let initialMedicationID: Medication.ID? = nil
+    @State private var selectedMedicationID: Medication.ID?
     @State private var selectedDate = Date()
     @State private var visibleMonth = Date()
+    @State private var pendingDeletion: DoseRecord?
 
     private let calendar = Calendar.current
     private let columns = Array(repeating: GridItem(.flexible(), spacing: 8), count: 7)
+
+    init(initialMedicationID: Medication.ID? = nil) {
+        _selectedMedicationID = State(initialValue: initialMedicationID)
+    }
+
+    private var adherence: MedicationAdherenceCalculator {
+        MedicationAdherenceCalculator(calendar: calendar)
+    }
 
     var body: some View {
         NavigationStack {
@@ -33,12 +42,40 @@ struct DoseHistoryView: View {
             .listStyle(.plain)
             .scrollContentBackground(.hidden)
             .background(AppTheme.backgroundTop)
+            .safeAreaInset(edge: .top, spacing: 0) {
+                if store.medications.count > 1 {
+                    medicationFilterRow
+                }
+            }
             .navigationTitle("Dose History")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
                 }
+            }
+            .confirmationDialog(
+                "Delete this dose record?",
+                isPresented: Binding(
+                    get: { pendingDeletion != nil },
+                    set: { isPresented in
+                        if !isPresented { pendingDeletion = nil }
+                    }
+                ),
+                titleVisibility: .visible,
+                presenting: pendingDeletion
+            ) { record in
+                Button("Delete", role: .destructive) {
+                    delete(record, returningTablets: false)
+                }
+                Button(returnTabletsTitle(for: record)) {
+                    delete(record, returningTablets: true)
+                }
+                Button("Cancel", role: .cancel) {
+                    pendingDeletion = nil
+                }
+            } message: { record in
+                Text(deletionMessage(for: record))
             }
         }
         .onAppear {
@@ -48,6 +85,61 @@ struct DoseHistoryView: View {
             }
         }
     }
+
+    // MARK: - Medication filter
+
+    private var medicationFilterRow: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                filterChip(title: "All", color: nil, isSelected: selectedMedicationID == nil) {
+                    selectedMedicationID = nil
+                }
+
+                ForEach(store.medications) { medication in
+                    filterChip(
+                        title: medication.name,
+                        color: Color(hex: medication.bottleColorHex),
+                        isSelected: selectedMedicationID == medication.id
+                    ) {
+                        selectedMedicationID = medication.id
+                    }
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 8)
+        }
+        .background(AppTheme.backgroundTop)
+    }
+
+    private func filterChip(
+        title: String,
+        color: Color?,
+        isSelected: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                if let color {
+                    Circle()
+                        .fill(isSelected ? Color.white : color)
+                        .frame(width: 8, height: 8)
+                }
+
+                Text(title)
+                    .font(.footnote.weight(.semibold))
+                    .lineLimit(1)
+            }
+            .foregroundStyle(isSelected ? Color.white : AppTheme.primaryText)
+            .padding(.horizontal, 14)
+            .frame(minHeight: 32)
+            .background(isSelected ? AppTheme.accent : AppTheme.surface, in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(color == nil ? "All medications" : title)
+        .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
+    }
+
+    // MARK: - Calendar
 
     private var monthHeader: some View {
         HStack {
@@ -64,7 +156,7 @@ struct DoseHistoryView: View {
             Spacer()
 
             Text(visibleMonth.formatted(.dateTime.month(.wide).year()))
-                .font(.system(size: 22, weight: .bold, design: .rounded))
+                .font(.title2.weight(.bold))
                 .foregroundStyle(AppTheme.primaryText)
 
             Spacer()
@@ -85,15 +177,16 @@ struct DoseHistoryView: View {
         LazyVGrid(columns: columns, spacing: 8) {
             ForEach(calendar.shortWeekdaySymbols, id: \.self) { symbol in
                 Text(symbol.prefix(1))
-                    .font(.system(size: 12, weight: .bold, design: .rounded))
+                    .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
-                    .frame(height: 18)
+                    .frame(minHeight: 18)
             }
         }
     }
 
     private var monthGrid: some View {
         let countsByDay = doseCountsByDay
+        let medications = scopedMedications
 
         return LazyVGrid(columns: columns, spacing: 8) {
             ForEach(monthDays, id: \.self) { day in
@@ -102,7 +195,11 @@ struct DoseHistoryView: View {
                         date: day,
                         isSelected: calendar.isDate(day, inSameDayAs: selectedDate),
                         isToday: calendar.isDateInToday(day),
-                        doseCount: countsByDay[calendar.startOfDay(for: day), default: 0]
+                        status: adherence.dayStatus(
+                            expectedDoses: adherence.expectedDoseCount(for: medications, on: day),
+                            loggedDoses: countsByDay[calendar.startOfDay(for: day), default: 0],
+                            on: day
+                        )
                     ) {
                         withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
                             selectedDate = day
@@ -117,24 +214,36 @@ struct DoseHistoryView: View {
     }
 
     private var selectedDaySummary: some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(selectedDate.formatted(.dateTime.weekday(.wide).month(.wide).day()))
-                    .font(.system(size: 18, weight: .bold, design: .rounded))
-                Text(selectedDaySummaryText)
-                    .font(.system(size: 14, weight: .medium, design: .rounded))
-                    .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(selectedDate.formatted(.dateTime.weekday(.wide).month(.wide).day()))
+                        .font(.headline)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(selectedDaySummaryText)
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer()
+
+                Text("\(selectedDayTabletTotal)")
+                    .font(.title.weight(.bold))
+                    .foregroundStyle(AppTheme.accent)
+                    .accessibilityLabel("\(selectedDayTabletTotal) tablet\(selectedDayTabletTotal == 1 ? "" : "s") taken")
             }
 
-            Spacer()
-
-            Text("\(selectedDayTabletTotal)")
-                .font(.system(size: 28, weight: .bold, design: .rounded))
-                .foregroundStyle(AppTheme.accent)
-                .accessibilityLabel("\(selectedDayTabletTotal) tablet\(selectedDayTabletTotal == 1 ? "" : "s") taken")
+            if currentStreak > 0 {
+                Label("\(currentStreak) day streak", systemImage: "flame.fill")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(AppTheme.accent)
+                    .accessibilityLabel("Current streak, \(currentStreak) day\(currentStreak == 1 ? "" : "s")")
+            }
         }
         .padding(16)
-        .background(AppTheme.surfaceStrong, in: RoundedRectangle(cornerRadius: 8))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .medicationCardSurface(.secondary, borderOpacity: 0)
     }
 
     private var recordsSection: some View {
@@ -157,15 +266,29 @@ struct DoseHistoryView: View {
                         .listRowInsets(EdgeInsets(top: 5, leading: 20, bottom: 5, trailing: 20))
                         .listRowSeparator(.hidden)
                         .listRowBackground(Color.clear)
+                        .swipeActions(edge: .trailing) {
+                            Button(role: .destructive) {
+                                pendingDeletion = record
+                            } label: {
+                                Label("Delete", systemImage: "trash")
+                            }
+                        }
                 }
-                .onDelete(perform: deleteSelectedDayDoseRecords)
             }
         }
     }
 
+    // MARK: - Data
+
+    /// The medications the current filter covers — one, or every active medication.
+    private var scopedMedications: [Medication] {
+        guard let selectedMedicationID else { return store.medications }
+        return store.medications.filter { $0.id == selectedMedicationID }
+    }
+
     private var displayedRecords: [DoseRecord] {
-        guard let initialMedicationID else { return store.doseRecords }
-        return store.doseRecords.filter { $0.medicationID == initialMedicationID }
+        guard let selectedMedicationID else { return store.doseRecords }
+        return store.doseRecords.filter { $0.medicationID == selectedMedicationID }
     }
 
     private var activeMedicationIDs: Set<Medication.ID> {
@@ -173,8 +296,8 @@ struct DoseHistoryView: View {
     }
 
     private var isShowingDeletedMedicationHistory: Bool {
-        guard let initialMedicationID else { return false }
-        return !activeMedicationIDs.contains(initialMedicationID) && !displayedRecords.isEmpty
+        guard let selectedMedicationID else { return false }
+        return !activeMedicationIDs.contains(selectedMedicationID) && !displayedRecords.isEmpty
     }
 
     @ViewBuilder
@@ -188,17 +311,17 @@ struct DoseHistoryView: View {
 
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Deleted medication")
-                        .font(.system(size: 14, weight: .bold, design: .rounded))
+                        .font(.footnote.weight(.semibold))
                         .foregroundStyle(AppTheme.primaryText)
                     Text("Preserved doses are shown using the medication name saved with each record.")
-                        .font(.system(size: 13, weight: .medium, design: .rounded))
+                        .font(.footnote.weight(.medium))
                         .foregroundStyle(.secondary)
                 }
 
                 Spacer(minLength: 0)
             }
             .padding(12)
-            .background(AppTheme.surface, in: RoundedRectangle(cornerRadius: 8))
+            .medicationCardSurface(.tertiary)
             .accessibilityElement(children: .combine)
             .accessibilityLabel("Deleted medication history")
             .accessibilityHint("Dose records are preserved and use the medication name saved at the time they were recorded.")
@@ -217,12 +340,25 @@ struct DoseHistoryView: View {
     private var selectedDaySummaryText: String {
         let doseCount = selectedDayRecords.count
         let doseText = "\(doseCount) dose\(doseCount == 1 ? "" : "s")"
-        guard initialMedicationID == nil, doseCount > 0 else {
+        let expected = adherence.expectedDoseCount(for: scopedMedications, on: selectedDate)
+
+        if expected > 0 {
+            return "\(doseCount) of \(expected) doses recorded"
+        }
+
+        guard selectedMedicationID == nil, doseCount > 0 else {
             return "\(doseText) recorded"
         }
 
         let medicationCount = Set(selectedDayRecords.map(\.medicationID)).count
         return "\(doseText) across \(medicationCount) medication\(medicationCount == 1 ? "" : "s")"
+    }
+
+    private var currentStreak: Int {
+        adherence.currentStreak(
+            medications: scopedMedications,
+            loggedDosesByDay: doseCountsByDay
+        )
     }
 
     private var monthDays: [Date?] {
@@ -259,15 +395,23 @@ struct DoseHistoryView: View {
         }
     }
 
-    private func deleteSelectedDayDoseRecords(at offsets: IndexSet) {
-        let records = selectedDayRecords
-        let recordIDs = Set(
-            offsets.compactMap { offset in
-                records.indices.contains(offset) ? records[offset].id : nil
-            }
-        )
+    // MARK: - Deletion
 
-        store.deleteDoseRecords(withIDs: recordIDs)
+    private func returnTabletsTitle(for record: DoseRecord) -> String {
+        let count = max(1, record.tabletCount)
+        return "Delete and return \(count) tablet\(count == 1 ? "" : "s") to the bottle"
+    }
+
+    private func deletionMessage(for record: DoseRecord) -> String {
+        let count = max(1, record.tabletCount)
+        let dayText = record.takenAt.formatted(.dateTime.month(.abbreviated).day())
+        let timeText = record.takenAt.formatted(date: .omitted, time: .shortened)
+        return "\(record.medicationName), \(count) tablet\(count == 1 ? "" : "s"), \(dayText) at \(timeText)."
+    }
+
+    private func delete(_ record: DoseRecord, returningTablets: Bool) {
+        store.deleteDoseRecords(withIDs: [record.id], returningTablets: returningTablets)
+        pendingDeletion = nil
     }
 }
 
@@ -275,7 +419,7 @@ private struct DayCell: View {
     let date: Date
     let isSelected: Bool
     let isToday: Bool
-    let doseCount: Int
+    let status: MedicationDayStatus
     var action: () -> Void
 
     private var calendar: Calendar { .current }
@@ -284,16 +428,8 @@ private struct DayCell: View {
         Button(action: action) {
             VStack(spacing: 4) {
                 Text("\(calendar.component(.day, from: date))")
-                    .font(.system(size: 15, weight: .bold, design: .rounded))
-                if doseCount > 0 {
-                    Circle()
-                        .fill(isSelected ? .white : AppTheme.accent)
-                        .frame(width: 6, height: 6)
-                        .accessibilityHidden(true)
-                } else {
-                    Color.clear
-                        .frame(width: 6, height: 6)
-                }
+                    .font(.subheadline.weight(.semibold))
+                marker
             }
             .foregroundStyle(isSelected ? .white : AppTheme.primaryText)
             .frame(maxWidth: .infinity)
@@ -310,16 +446,55 @@ private struct DayCell: View {
         .accessibilityLabel(accessibilityLabel)
     }
 
+    /// Complete fills, partial half-fills, missed rings, nothing expected shows nothing.
+    @ViewBuilder
+    private var marker: some View {
+        switch status.adherence {
+        case .complete:
+            Circle()
+                .fill(markerColor)
+                .frame(width: 6, height: 6)
+                .accessibilityHidden(true)
+        case .partial:
+            ZStack(alignment: .leading) {
+                Circle()
+                    .fill(markerColor.opacity(0.2))
+                    .frame(width: 6, height: 6)
+
+                Circle()
+                    .fill(markerColor)
+                    .frame(width: 6, height: 6)
+                    .mask(alignment: .leading) {
+                        Rectangle().frame(width: 3)
+                    }
+            }
+            .frame(width: 6, height: 6)
+            .accessibilityHidden(true)
+        case .missed:
+            Circle()
+                .strokeBorder(isSelected ? Color.white : AppTheme.warning, lineWidth: 1.5)
+                .frame(width: 6, height: 6)
+                .accessibilityHidden(true)
+        case .none:
+            Color.clear
+                .frame(width: 6, height: 6)
+        }
+    }
+
+    private var markerColor: Color {
+        isSelected ? .white : AppTheme.accent
+    }
+
     private var backgroundStyle: Color {
         if isSelected {
             return AppTheme.accent
         }
-        return doseCount > 0 ? AppTheme.surfaceStrong : AppTheme.surfaceSubtle
+        return status.loggedDoses > 0 ? AppTheme.surfaceStrong : AppTheme.surfaceSubtle
     }
 
     private var accessibilityLabel: String {
         let dateText = date.formatted(.dateTime.month(.wide).day().year())
-        return "\(dateText), \(doseCount) dose\(doseCount == 1 ? "" : "s")"
+        return "\(dateText)\(status.accessibilitySuffix)"
     }
 }
 
@@ -331,26 +506,27 @@ private struct DoseRecordRow: View {
         HStack(spacing: 14) {
             VStack(spacing: 2) {
                 Text(record.takenAt.formatted(date: .omitted, time: .shortened))
-                    .font(.system(size: 15, weight: .bold, design: .rounded))
+                    .font(.subheadline.weight(.semibold))
                 Text(record.takenAt.formatted(.dateTime.month(.abbreviated).day()))
-                    .font(.system(size: 12, weight: .medium, design: .rounded))
+                    .font(.caption.weight(.medium))
                     .foregroundStyle(.secondary)
             }
-            .frame(width: 76)
+            .frame(minWidth: 76)
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(record.medicationName)
-                    .font(.system(size: 17, weight: .bold, design: .rounded))
+                    .font(.body.weight(.semibold))
                     .foregroundStyle(AppTheme.primaryText)
+                    .fixedSize(horizontal: false, vertical: true)
 
                 HStack(spacing: 8) {
                     Text("\(record.tabletCount) tablet\(record.tabletCount == 1 ? "" : "s") taken")
-                        .font(.system(size: 14, weight: .medium, design: .rounded))
+                        .font(.footnote.weight(.medium))
                         .foregroundStyle(.secondary)
 
                     if !isMedicationActive {
                         Text("Deleted")
-                            .font(.system(size: 12, weight: .bold, design: .rounded))
+                            .font(.caption.weight(.semibold))
                             .foregroundStyle(AppTheme.accent)
                             .padding(.horizontal, 7)
                             .padding(.vertical, 3)
@@ -366,7 +542,7 @@ private struct DoseRecordRow: View {
                 .foregroundStyle(AppTheme.accent)
         }
         .padding(14)
-        .background(AppTheme.surfaceStrong, in: RoundedRectangle(cornerRadius: 8))
+        .medicationCardSurface(.tertiary)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityLabel)
         .accessibilityHint(accessibilityHint)

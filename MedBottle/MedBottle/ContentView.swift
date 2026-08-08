@@ -5,12 +5,96 @@ struct ContentView: View {
 
     var body: some View {
         MedicationSelectionContainer(store: store)
+            .fontDesign(.rounded)
     }
 }
 
-private enum MedicationTransitionDirection {
-    case forward
-    case backward
+/// Carries which medication history opens for, so the filter is set at presentation
+/// time rather than racing a separate `isPresented` flag.
+private struct DoseHistoryPresentation: Identifiable {
+    let medicationID: Medication.ID?
+    var id: String { medicationID?.uuidString ?? "all" }
+}
+
+extension String {
+    /// Lowercases a leading word only when it is not a proper noun, so
+    /// "Runs out Aug 24" reads inline without touching "Aug".
+    var lowercasedSentence: String {
+        guard let first = first, first.isUppercase else { return self }
+        return first.lowercased() + dropFirst()
+    }
+}
+
+/// The three card weights defined by the design review. Every card in the app draws
+/// its surface through this modifier so the tiers stay consistent.
+enum MedicationCardTier {
+    case primary    // today verdict — tinted, 22pt, 1pt tint border
+    case secondary  // stock — surfaceStrong, 22pt, 1pt status border
+    case tertiary   // reminder, dose history — surface, 18pt, no border
+
+    var cornerRadius: CGFloat {
+        switch self {
+        case .primary, .secondary: 22
+        case .tertiary: 18
+        }
+    }
+
+    var defaultBorderOpacity: Double {
+        switch self {
+        case .primary: 0.24
+        case .secondary: 0.22
+        case .tertiary: 0
+        }
+    }
+}
+
+struct MedicationCardSurface: ViewModifier {
+    let tier: MedicationCardTier
+    var fill: Color?
+    var borderTint: Color = AppTheme.accent
+    var borderOpacity: Double?
+    var borderWidth: CGFloat = 1
+
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: tier.cornerRadius, style: .continuous)
+        let opacity = borderOpacity ?? tier.defaultBorderOpacity
+
+        return content
+            .background(fill ?? defaultFill, in: shape)
+            .overlay {
+                if opacity > 0 {
+                    shape.strokeBorder(borderTint.opacity(opacity), lineWidth: borderWidth)
+                }
+            }
+    }
+
+    private var defaultFill: Color {
+        switch tier {
+        case .primary: AppTheme.accent.opacity(0.10)
+        case .secondary: AppTheme.surfaceStrong
+        case .tertiary: AppTheme.surface
+        }
+    }
+}
+
+extension View {
+    func medicationCardSurface(
+        _ tier: MedicationCardTier,
+        fill: Color? = nil,
+        borderTint: Color = AppTheme.accent,
+        borderOpacity: Double? = nil,
+        borderWidth: CGFloat = 1
+    ) -> some View {
+        modifier(
+            MedicationCardSurface(
+                tier: tier,
+                fill: fill,
+                borderTint: borderTint,
+                borderOpacity: borderOpacity,
+                borderWidth: borderWidth
+            )
+        )
+    }
 }
 
 struct RefillView: View {
@@ -142,10 +226,13 @@ private struct MedicationSelectionContainer: View {
     let store: MedicationStore
 
     @StateObject private var selectionViewModel: MedicationSelectionViewModel
-    @State private var transitionDirection: MedicationTransitionDirection = .forward
+    /// The page the pager is actually resting on. Kept in sync with the view model's
+    /// selection in both directions: a swipe writes here first, a programmatic
+    /// selection (Manage sheet, VoiceOver) writes there first.
+    @State private var scrolledMedicationID: Medication.ID?
     @State private var isAddingMedication = false
     @State private var refillMedication: Medication?
-    @State private var isShowingHistory = false
+    @State private var historyPresentation: DoseHistoryPresentation?
     @State private var isManagingMedications = false
 
     init(store: MedicationStore) {
@@ -165,43 +252,14 @@ private struct MedicationSelectionContainer: View {
                             isAddingMedication = true
                         },
                         historyAction: {
-                            isShowingHistory = true
+                            historyPresentation = DoseHistoryPresentation(medicationID: nil)
                         }
                     )
                     .padding(.horizontal, 20)
-                } else if let medication = selectionViewModel.selectedMedication {
-                    MedicationDetailScreen(
-                        medication: medication,
-                        store: store,
-                        pageCount: selectionViewModel.pageCount,
-                        selectedIndex: selectionViewModel.selectedIndex,
-                        canMovePrevious: selectionViewModel.canMovePrevious,
-                        canMoveNext: selectionViewModel.canMoveNext,
-                        onAddMedication: {
-                            isAddingMedication = true
-                        },
-                        onManageMedications: {
-                            isManagingMedications = true
-                        },
-                        onShowHistory: {
-                            isShowingHistory = true
-                        },
-                        onRefill: { medication in
-                            refillMedication = medication
-                        },
-                        onMovePrevious: {
-                            movePreviousMedication()
-                        },
-                        onMoveNext: {
-                            moveNextMedication()
-                        }
-                    )
-                    .id(medication.id)
-                    .transition(medicationTransition)
-                    .zIndex(1)
+                } else {
+                    medicationPager
                 }
             }
-            .animation(medicationTransitionAnimation, value: selectionViewModel.selectedMedicationID)
             .toolbar(.hidden, for: .navigationBar)
             .sheet(isPresented: $isAddingMedication) {
                 AddMedicationView()
@@ -211,8 +269,8 @@ private struct MedicationSelectionContainer: View {
                 RefillView(medication: medication)
                     .environmentObject(store)
             }
-            .sheet(isPresented: $isShowingHistory) {
-                DoseHistoryView()
+            .sheet(item: $historyPresentation) { presentation in
+                DoseHistoryView(initialMedicationID: presentation.medicationID)
                     .environmentObject(store)
             }
             .sheet(isPresented: $isManagingMedications) {
@@ -239,6 +297,64 @@ private struct MedicationSelectionContainer: View {
         }
     }
 
+    /// One full-width page per medication on the system's paging scroll, so the screens
+    /// track the finger, rubber-band at the ends and settle with the gesture's velocity.
+    /// Pages hold their own view models for as long as they live, so swiping back is
+    /// instant instead of rebuilding the screen and re-reading its snapshot.
+    private var medicationPager: some View {
+        ScrollView(.horizontal) {
+            LazyHStack(spacing: 0) {
+                ForEach(Array(selectionViewModel.medications.enumerated()), id: \.element.id) { index, medication in
+                    MedicationDetailScreen(
+                        medication: medication,
+                        store: store,
+                        pageCount: selectionViewModel.pageCount,
+                        selectedIndex: index,
+                        onAddMedication: {
+                            isAddingMedication = true
+                        },
+                        onManageMedications: {
+                            isManagingMedications = true
+                        },
+                        onShowHistory: {
+                            historyPresentation = DoseHistoryPresentation(medicationID: medication.id)
+                        },
+                        onRefill: { medication in
+                            refillMedication = medication
+                        },
+                        onMovePrevious: {
+                            movePreviousMedication()
+                        },
+                        onMoveNext: {
+                            moveNextMedication()
+                        }
+                    )
+                    .containerRelativeFrame(.horizontal)
+                }
+            }
+            .scrollTargetLayout()
+        }
+        .scrollTargetBehavior(.paging)
+        .scrollPosition(id: $scrolledMedicationID)
+        .scrollIndicators(.hidden)
+        // A single medication has nowhere to page to; without this it still rubber-bands.
+        .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+        .onAppear {
+            scrolledMedicationID = selectionViewModel.selectedMedicationID
+        }
+        .onChange(of: scrolledMedicationID) { _, settledID in
+            guard let settledID, settledID != selectionViewModel.selectedMedicationID else { return }
+            // The scroll already animated the change; re-animating it here would fight it.
+            selectionViewModel.selectMedication(id: settledID)
+        }
+        .onChange(of: selectionViewModel.selectedMedicationID) { _, selectedID in
+            guard let selectedID, selectedID != scrolledMedicationID else { return }
+            withAnimation(pageScrollAnimation) {
+                scrolledMedicationID = selectedID
+            }
+        }
+    }
+
     private var selectedMedicationIDBinding: Binding<Medication.ID?> {
         Binding(
             get: {
@@ -254,66 +370,27 @@ private struct MedicationSelectionContainer: View {
         )
     }
 
+    // Selection changes that do not come from the finger still move the pager: they
+    // write the selection, and the pager scrolls itself to match.
     private func movePreviousMedication() {
-        guard selectionViewModel.canMovePrevious else { return }
-
-        transitionDirection = .backward
-        withAnimation(medicationTransitionAnimation) {
-            _ = selectionViewModel.movePrevious()
-        }
+        _ = selectionViewModel.movePrevious()
     }
 
     private func moveNextMedication() {
-        guard selectionViewModel.canMoveNext else { return }
-
-        transitionDirection = .forward
-        withAnimation(medicationTransitionAnimation) {
-            _ = selectionViewModel.moveNext()
-        }
+        _ = selectionViewModel.moveNext()
     }
 
     private func selectMedication(id medicationID: Medication.ID) {
-        guard let targetIndex = selectionViewModel.medications.firstIndex(where: { $0.id == medicationID }) else {
-            _ = selectionViewModel.selectMedication(id: medicationID)
-            return
-        }
-
-        selectMedication(at: targetIndex)
+        _ = selectionViewModel.selectMedication(id: medicationID)
     }
 
     private func selectMedication(at targetIndex: Int) {
-        if let selectedIndex = selectionViewModel.selectedIndex, targetIndex != selectedIndex {
-            transitionDirection = targetIndex > selectedIndex ? .forward : .backward
-        }
-
-        withAnimation(medicationTransitionAnimation) {
-            _ = selectionViewModel.selectMedication(at: targetIndex)
-        }
+        _ = selectionViewModel.selectMedication(at: targetIndex)
     }
 
-    private var medicationTransition: AnyTransition {
-        guard !reduceMotion else { return .opacity }
-
-        return .asymmetric(
-            insertion: .move(edge: insertionEdge).combined(with: .opacity),
-            removal: .move(edge: removalEdge).combined(with: .opacity)
-        )
-    }
-
-    private var insertionEdge: Edge {
-        transitionDirection == .forward ? .trailing : .leading
-    }
-
-    private var removalEdge: Edge {
-        transitionDirection == .forward ? .leading : .trailing
-    }
-
-    private var medicationTransitionAnimation: Animation {
-        if reduceMotion {
-            return .easeInOut(duration: 0.12)
-        }
-
-        return .spring(response: 0.36, dampingFraction: 0.88, blendDuration: 0.08)
+    /// Only for selections made off-screen — a swipe is animated by the scroll itself.
+    private var pageScrollAnimation: Animation? {
+        reduceMotion ? nil : .snappy(duration: 0.34, extraBounce: 0.02)
     }
 
     private var background: some View {
@@ -329,8 +406,6 @@ struct MedicationDetailScreen: View {
     let medication: Medication
     let pageCount: Int
     let selectedIndex: Int?
-    let canMovePrevious: Bool
-    let canMoveNext: Bool
     var onAddMedication: () -> Void
     var onManageMedications: () -> Void
     var onShowHistory: () -> Void
@@ -342,17 +417,13 @@ struct MedicationDetailScreen: View {
     @State private var remainingHighlight = false
     @State private var doseFeedbackTrigger = 0
     @State private var manualDoseMedication: Medication?
-    @State private var isBottleInteractionActive = false
     private let primaryColor = AppTheme.accent
-    private let medicationSwipeThreshold: CGFloat = 96
 
     init(
         medication: Medication,
         store: MedicationStore,
         pageCount: Int,
         selectedIndex: Int?,
-        canMovePrevious: Bool,
-        canMoveNext: Bool,
         onAddMedication: @escaping () -> Void,
         onManageMedications: @escaping () -> Void,
         onShowHistory: @escaping () -> Void,
@@ -363,8 +434,6 @@ struct MedicationDetailScreen: View {
         self.medication = medication
         self.pageCount = pageCount
         self.selectedIndex = selectedIndex
-        self.canMovePrevious = canMovePrevious
-        self.canMoveNext = canMoveNext
         self.onAddMedication = onAddMedication
         self.onManageMedications = onManageMedications
         self.onShowHistory = onShowHistory
@@ -387,28 +456,22 @@ struct MedicationDetailScreen: View {
                     }
 
                     if let snapshot = viewModel.snapshot {
+                        MedicationTodayCard(status: snapshot.todayStatus)
+
                         MedicationDetailHeroSection(
                             snapshot: snapshot,
-                            sceneHeight: bottleSceneHeight(for: geometry),
-                            onBottleInteractionBegan: {
-                                isBottleInteractionActive = true
-                            }
+                            sceneHeight: bottleSceneHeight(for: geometry)
                         )
 
                         MedicationStockCard(
                             status: snapshot.stockStatus,
                             tint: Color(hex: snapshot.hero.bottleColorHex),
+                            tabletsPerDose: max(1, snapshot.medication.tabletsPerDose),
                             isHighlighted: remainingHighlight,
                             refillAction: {
                                 onRefill(snapshot.medication)
                             }
                         )
-
-                        if let lastTakenMetric = lastTakenMetric(from: snapshot) {
-                            MedicationLastTakenCard(metric: lastTakenMetric)
-                        }
-
-                        MedicationReminderCard(overview: snapshot.reminderOverview)
 
                         RecentDoseRecordsCard(
                             records: snapshot.recentDoseRecords,
@@ -428,10 +491,13 @@ struct MedicationDetailScreen: View {
                 .padding(.horizontal, 20)
                 .padding(.bottom, 84)
             }
+            // The stack grows when the snapshot replaces the loading card; without this
+            // the scroll view keeps its old offset and the verdict card starts hidden
+            // under the toolbar.
+            .defaultScrollAnchor(.top)
             .refreshable {
                 await viewModel.refresh()
             }
-            .simultaneousGesture(medicationSwipeGesture)
             .accessibilityLabel("Medication detail")
             .accessibilityValue(accessibilitySelectionValue)
             .accessibilityHint(accessibilitySelectionHint)
@@ -465,16 +531,29 @@ struct MedicationDetailScreen: View {
                 .background(.clear)
             }
             .safeAreaInset(edge: .bottom, spacing: 0) {
-                if let snapshot = viewModel.snapshot {
-                    MedicationDetailActionBar(
-                        actions: snapshot.actions,
-                        isLoading: viewModel.isLoading,
-                        primaryColor: primaryColor,
-                        primaryAction: {
-                            handlePrimaryAction(snapshot)
+                VStack(spacing: 8) {
+                    if let undoableDose = viewModel.undoableDose {
+                        DoseUndoBar(record: undoableDose) {
+                            viewModel.undoLastDose()
                         }
-                    )
+                        .transition(undoTransition)
+                    }
+
+                    if let snapshot = viewModel.snapshot {
+                        MedicationDetailActionBar(
+                            actions: snapshot.actions,
+                            isLoading: viewModel.isLoading,
+                            primaryColor: primaryColor,
+                            primaryAction: {
+                                handlePrimaryAction(snapshot)
+                            }
+                        )
+                    }
                 }
+                .animation(undoAnimation, value: viewModel.undoableDose?.id)
+            }
+            .onDisappear {
+                viewModel.cancelUndo()
             }
             .alert(
                 "Medication update failed",
@@ -505,23 +584,22 @@ struct MedicationDetailScreen: View {
         }
     }
 
-    private func lastTakenMetric(from snapshot: MedicationDetailSnapshot) -> MedicationDetailMetric? {
-        snapshot.metrics.first { $0.kind == .lastTaken }
+    private var undoTransition: AnyTransition {
+        reduceMotion ? .opacity : .move(edge: .bottom).combined(with: .opacity)
+    }
+
+    private var undoAnimation: Animation? {
+        reduceMotion ? nil : .spring(response: 0.30, dampingFraction: 0.85)
     }
 
     private func historyMetric(from snapshot: MedicationDetailSnapshot) -> MedicationDetailMetric? {
         snapshot.metrics.first { $0.kind == .doseHistory }
     }
 
+    /// The stage is now only as tall as the bottle it draws — the old height reserved
+    /// 37% headroom for a hint that no longer exists, which read as a hole in the layout.
     private func bottleSceneHeight(for geometry: GeometryProxy) -> CGFloat {
-        min(236, max(212, geometry.size.height * 0.27))
-    }
-
-    private var medicationSwipeGesture: some Gesture {
-        DragGesture(minimumDistance: 24, coordinateSpace: .local)
-            .onEnded { value in
-                handleMedicationSwipe(value)
-            }
+        min(157, max(141, geometry.size.height * 0.18))
     }
 
     private var accessibilitySelectionValue: String {
@@ -538,29 +616,6 @@ struct MedicationDetailScreen: View {
         }
 
         return "Swipe left or right with one finger to switch medications. Swipe up or down with VoiceOver to change medications."
-    }
-
-    private func handleMedicationSwipe(_ value: DragGesture.Value) {
-        defer { isBottleInteractionActive = false }
-
-        guard !isBottleInteractionActive else { return }
-        guard pageCount > 1 else { return }
-
-        let horizontalDistance = value.translation.width
-        let verticalDistance = value.translation.height
-        let predictedHorizontalDistance = value.predictedEndTranslation.width
-        let effectiveHorizontalDistance = abs(predictedHorizontalDistance) > abs(horizontalDistance)
-            ? predictedHorizontalDistance
-            : horizontalDistance
-
-        guard abs(effectiveHorizontalDistance) >= medicationSwipeThreshold else { return }
-        guard abs(horizontalDistance) > abs(verticalDistance) * 1.5 else { return }
-
-        if effectiveHorizontalDistance < 0 {
-            onMoveNext()
-        } else {
-            onMovePrevious()
-        }
     }
 
     private func handlePrimaryAction(_ snapshot: MedicationDetailSnapshot) {
@@ -596,7 +651,7 @@ struct MedicationDetailScreen: View {
     }
 }
 
-private struct MedicationDetailBackground: View {
+struct MedicationDetailBackground: View {
     let tint: Color?
 
     var body: some View {
@@ -675,22 +730,22 @@ private struct MedicationDetailToolbar: View {
     private var toolbarButtons: some View {
         HStack(spacing: 10) {
             ToolbarIconButton(
-                systemImage: "plus",
-                label: "Add medication",
-                hint: "Opens the form to add another medication.",
-                isPrimary: true,
-                action: onAddMedication
-            )
-            ToolbarIconButton(
                 systemImage: "list.bullet",
                 label: "Manage medications",
                 hint: "Opens medication management.",
                 action: onManageMedications
             )
             ToolbarIconButton(
+                systemImage: "plus",
+                label: "Add medication",
+                hint: "Opens the form to add another medication.",
+                action: onAddMedication
+            )
+            ToolbarIconButton(
                 systemImage: "calendar",
                 label: "Dose history",
                 hint: "Shows logged doses.",
+                isPrimary: true,
                 action: onShowHistory
             )
         }
@@ -779,9 +834,20 @@ struct LiquidGlassCapsuleButtonStyle: ButtonStyle {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var tint: Color = AppTheme.accent
+    /// `false` draws the outlined variant used once today's dose is already logged.
+    var isProminent = true
 
     @ViewBuilder
     func makeBody(configuration: Configuration) -> some View {
+        if isProminent {
+            prominentBody(configuration: configuration)
+        } else {
+            outlinedBody(configuration: configuration)
+        }
+    }
+
+    @ViewBuilder
+    private func prominentBody(configuration: Configuration) -> some View {
         if #available(iOS 26.0, *), !reduceTransparency {
             nativeGlassBody(configuration: configuration)
         } else {
@@ -794,7 +860,7 @@ struct LiquidGlassCapsuleButtonStyle: ButtonStyle {
         configuration.label
             .foregroundStyle(.white)
             .frame(maxWidth: .infinity)
-            .frame(height: 56)
+            .frame(minHeight: 56)
             .contentShape(Capsule())
             .glassEffect(.regular.tint(tint.opacity(0.82)).interactive(), in: .capsule)
             .scaleEffect(configuration.isPressed ? 0.975 : 1)
@@ -805,7 +871,7 @@ struct LiquidGlassCapsuleButtonStyle: ButtonStyle {
         configuration.label
             .foregroundStyle(.white)
             .frame(maxWidth: .infinity)
-            .frame(height: 56)
+            .frame(minHeight: 56)
             .background(tint, in: Capsule())
             .overlay {
                 Capsule()
@@ -813,6 +879,21 @@ struct LiquidGlassCapsuleButtonStyle: ButtonStyle {
             }
             .scaleEffect(configuration.isPressed ? 0.985 : 1)
             .animation(reduceMotion ? nil : .easeOut(duration: 0.12), value: configuration.isPressed)
+            .contentShape(Capsule())
+    }
+
+    private func outlinedBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundStyle(tint)
+            .frame(maxWidth: .infinity)
+            .frame(minHeight: 56)
+            .background(AppTheme.surface, in: Capsule())
+            .overlay {
+                Capsule()
+                    .strokeBorder(tint.opacity(0.35), lineWidth: 1.5)
+            }
+            .scaleEffect(configuration.isPressed ? 0.985 : 1)
+            .animation(reduceMotion ? nil : .spring(response: 0.22, dampingFraction: 0.84), value: configuration.isPressed)
             .contentShape(Capsule())
     }
 }
@@ -933,17 +1014,23 @@ struct LiquidGlassButtonStyleExampleContentView: View {
 private struct MedicationDetailHeroSection: View {
     let snapshot: MedicationDetailSnapshot
     let sceneHeight: CGFloat
-    var onBottleInteractionBegan: () -> Void
-    @AppStorage("hasDiscoveredBottleRotation") private var hasDiscoveredBottleRotation = false
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     var body: some View {
         VStack(alignment: .center, spacing: 2) {
-            heroText(alignment: .center, textAlignment: .center, titleSize: 24)
+            heroText(alignment: .center, textAlignment: .center)
                 .frame(maxWidth: 340, alignment: .center)
                 .padding(.bottom, 12)
 
             bottleStage
+
+            // At accessibility sizes the readout no longer fits beside the bottle, so
+            // it drops below the stage rather than overlapping the glass.
+            if dynamicTypeSize.isAccessibilitySize {
+                supplyReadout
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+                    .padding(.top, 4)
+            }
         }
         .padding(.horizontal, 10)
         .padding(.top, 4)
@@ -952,8 +1039,7 @@ private struct MedicationDetailHeroSection: View {
 
     private func heroText(
         alignment: HorizontalAlignment,
-        textAlignment: TextAlignment,
-        titleSize: CGFloat
+        textAlignment: TextAlignment
     ) -> some View {
         VStack(alignment: alignment, spacing: 10) {
             HStack(spacing: 8) {
@@ -961,157 +1047,289 @@ private struct MedicationDetailHeroSection: View {
                     .fill(Color(hex: snapshot.hero.bottleColorHex))
                     .frame(width: 11, height: 11)
 
-                Text("\(snapshot.hero.classificationText) \(snapshot.hero.shapeText)")
-                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                Text(snapshot.hero.classificationText)
+                    .font(.footnote.weight(.semibold))
                     .foregroundStyle(AppTheme.secondaryText)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.78)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             .padding(.horizontal, 12)
-            .frame(height: 30)
+            .padding(.vertical, 6)
+            .frame(minHeight: 30)
             .background(AppTheme.surfaceSubtle, in: Capsule())
 
             Text(snapshot.hero.name)
-                .font(.system(size: titleSize, weight: .semibold, design: .rounded))
+                .font(.title2.weight(.semibold))
                 .foregroundStyle(AppTheme.primaryText)
                 .multilineTextAlignment(textAlignment)
                 .lineLimit(2)
-                .minimumScaleFactor(0.72)
                 .fixedSize(horizontal: false, vertical: true)
         }
     }
 
+    /// Purely a readout. It takes no taps, so a swipe that starts on the glass still
+    /// pages to the next medication instead of being swallowed by the bottle.
     private func bottleScene(height: CGFloat) -> some View {
-        BottleSceneView(medication: snapshot.medication) {
-            hasDiscoveredBottleRotation = true
-            onBottleInteractionBegan()
-        }
+        MedicationBottleGauge(medication: snapshot.medication, height: height)
             .frame(maxWidth: .infinity)
             .frame(height: height)
-            .accessibilityLabel("\(snapshot.hero.name) bottle visualization")
-            .accessibilityHint("Drag horizontally to rotate the bottle.")
+            .allowsHitTesting(false)
+            .accessibilityLabel("\(snapshot.hero.name) bottle")
+    }
+
+    /// The bottle now carries the number, so the readout sits at the stage's baseline
+    /// beside it rather than in a card below.
+    @ViewBuilder
+    private var supplyReadout: some View {
+        let status = snapshot.stockStatus
+
+        VStack(alignment: .trailing, spacing: 0) {
+            Text(status.daysRemaining.map(String.init) ?? "\(status.remainingCount)")
+                .font(.largeTitle.weight(.bold))
+                .foregroundStyle(AppTheme.primaryText)
+                .contentTransition(.numericText())
+                .lineLimit(1)
+
+            Text(supplyUnitText)
+                .font(.footnote)
+                .foregroundStyle(AppTheme.secondaryText)
+
+            Text(status.supplyDetail.lowercasedSentence)
+                .font(.footnote)
+                .foregroundStyle(AppTheme.secondaryText)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .multilineTextAlignment(.trailing)
+        .frame(maxWidth: dynamicTypeSize.isAccessibilitySize ? .infinity : 124, alignment: .trailing)
+        .padding(.bottom, 2)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(status.supplyHeadline). \(status.supplyDetail).")
+    }
+
+    private var supplyUnitText: String {
+        guard let daysRemaining = snapshot.stockStatus.daysRemaining else {
+            return snapshot.stockStatus.remainingCount == 1 ? "tablet left" : "tablets left"
+        }
+        return daysRemaining == 1 ? "day left" : "days left"
     }
 
     private var bottleStage: some View {
         bottleScene(height: sceneHeight)
             .frame(maxWidth: 360, alignment: .center)
             .frame(height: sceneHeight, alignment: .center)
-            .clipped()
-            .overlay(alignment: .bottom) {
-                if !hasDiscoveredBottleRotation && !reduceMotion {
-                    Label("Drag to rotate", systemImage: "rotate.3d")
-                        .font(.system(size: 12, weight: .semibold, design: .rounded))
-                        .foregroundStyle(AppTheme.secondaryText)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(AppTheme.surfaceSubtle, in: Capsule())
-                        .padding(.bottom, 4)
-                        .accessibilityHidden(true)
+            .overlay(alignment: .bottomTrailing) {
+                if !dynamicTypeSize.isAccessibilitySize {
+                    supplyReadout
+                        .padding(.trailing, 4)
                 }
             }
     }
 }
 
-private struct MedicationLastTakenCard: View {
-    let metric: MedicationDetailMetric
+/// The screen's first answer: did I take this today? Kept free of any dependency
+/// beyond `MedicationTodayStatus` so a Lock Screen widget can reuse it verbatim.
+struct MedicationTodayCard: View {
+    let status: MedicationTodayStatus
 
     var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: iconName)
-                .font(.system(size: 16, weight: .bold))
-                .foregroundStyle(AppTheme.accent)
-                .frame(width: 36, height: 36)
-                .background(AppTheme.accent.opacity(0.11), in: Circle())
+        HStack(spacing: 14) {
+            Image(systemName: status.systemImage)
+                .font(.system(size: 19, weight: .bold))
+                .foregroundStyle(glyphColor)
+                .frame(width: 44, height: 44)
+                .background(iconCircleFill, in: Circle())
                 .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 3) {
-                Text(metric.title)
-                    .font(.system(size: 13, weight: .semibold, design: .rounded))
-                    .foregroundStyle(AppTheme.secondaryText)
-                    .lineLimit(1)
-
-                Text(metric.value)
-                    .font(.system(size: 18, weight: .bold, design: .rounded))
+                Text(status.title)
+                    .font(.headline)
                     .foregroundStyle(AppTheme.primaryText)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.72)
+                    .fixedSize(horizontal: false, vertical: true)
 
-                if let subtitle = metric.subtitle {
-                    Text(subtitle)
-                        .font(.system(size: 12, weight: .medium, design: .rounded))
-                        .foregroundStyle(AppTheme.secondaryText)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.82)
+                // The card is the screen's first answer, not a log: it stays two lines
+                // tall no matter how many doses the day collected.
+                Text(status.detail)
+                    .font(.subheadline)
+                    .foregroundStyle(AppTheme.secondaryText)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if !status.scheduleDetail.isEmpty {
+                    Label(status.scheduleDetail, systemImage: "bell.fill")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(AppTheme.tertiaryText)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.top, 2)
                 }
             }
 
             Spacer(minLength: 8)
         }
-        .padding(12)
-        .frame(maxWidth: .infinity, minHeight: 76, alignment: .leading)
-        .background(AppTheme.surface, in: RoundedRectangle(cornerRadius: 8))
-        .accessibilityElement(children: .combine)
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .medicationCardSurface(
+            tier,
+            fill: cardFill,
+            borderTint: accent,
+            borderOpacity: borderOpacity
+        )
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(status.accessibilityLabel)
     }
 
-    private var iconName: String {
-        metric.subtitle == nil ? "checkmark.circle.fill" : "clock"
+    private var tier: MedicationCardTier {
+        switch status.verdict {
+        case .takenToday, .dueNow: .primary
+        case .upcoming, .noSchedule: .tertiary
+        }
+    }
+
+    private var accent: Color {
+        switch status.verdict {
+        case .takenToday: AppTheme.accent
+        case .dueNow: AppTheme.warning
+        case .upcoming, .noSchedule: AppTheme.accent
+        }
+    }
+
+    private var cardFill: Color {
+        switch status.verdict {
+        case .takenToday: AppTheme.accent.opacity(0.10)
+        case .dueNow: AppTheme.warning.opacity(0.10)
+        case .upcoming, .noSchedule: AppTheme.surface
+        }
+    }
+
+    private var borderOpacity: Double {
+        switch status.verdict {
+        case .takenToday: 0.24
+        case .dueNow: 0.30
+        case .upcoming, .noSchedule: 0
+        }
+    }
+
+    private var iconCircleFill: Color {
+        switch status.verdict {
+        case .takenToday, .dueNow: accent
+        case .upcoming, .noSchedule: AppTheme.accent.opacity(0.11)
+        }
+    }
+
+    private var glyphColor: Color {
+        switch status.verdict {
+        case .takenToday, .dueNow: .white
+        case .upcoming, .noSchedule: AppTheme.accent
+        }
+    }
+}
+
+/// Five-second reversal for the dose that was just logged.
+private struct DoseUndoBar: View {
+    let record: DoseRecord
+    var undoAction: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text("Dose logged · \(record.takenAt.formatted(date: .omitted, time: .shortened))")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(AppTheme.primaryText)
+                .lineLimit(1)
+
+            Spacer(minLength: 8)
+
+            Button(action: undoAction) {
+                Text("Undo")
+                    .font(.footnote.weight(.bold))
+                    .foregroundStyle(AppTheme.accent)
+                    .frame(minWidth: 44, minHeight: 44)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint("Removes the dose that was just logged and returns the tablets to the bottle.")
+        }
+        .padding(.leading, 18)
+        .padding(.trailing, 8)
+        .frame(minHeight: 46)
+        .background(AppTheme.surfaceStrong, in: Capsule())
+        .shadow(color: .black.opacity(0.10), radius: 7, x: 0, y: 4)
+        .frame(maxWidth: 760)
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 20)
+        .accessibilityElement(children: .contain)
+        .onAppear {
+            AccessibilityNotification.Announcement("Dose logged. Undo available.").post()
+        }
     }
 }
 
 struct MedicationStockCard: View {
     let status: MedicationStockStatus
     let tint: Color
+    var tabletsPerDose: Int = 1
     let isHighlighted: Bool
     var refillAction: () -> Void
 
+    /// One row: the bottle above already carries the headline number.
     var body: some View {
         Button(action: refillAction) {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 8) {
-                    Label(titleText, systemImage: statusIcon)
-                        .font(.system(size: 13, weight: .bold, design: .rounded))
-                        .foregroundStyle(statusAccent)
-                        .lineLimit(1)
+            HStack(spacing: 10) {
+                Image(systemName: statusIcon)
+                    .font(.system(size: 16, weight: .bold))
+                    .foregroundStyle(statusAccent)
+                    .accessibilityHidden(true)
 
-                    Spacer(minLength: 8)
-
-                    refillIndicator
-                }
-
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text("\(status.remainingCount)")
-                        .font(.system(size: 44, weight: .bold, design: .rounded))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(rowSummaryText)
+                        .font(.footnote.weight(.semibold))
                         .foregroundStyle(AppTheme.primaryText)
-                        .contentTransition(.numericText())
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.58)
+                        .fixedSize(horizontal: false, vertical: true)
 
-                    Text(tabletLabel)
-                        .font(.system(size: 15, weight: .semibold, design: .rounded))
-                        .foregroundStyle(AppTheme.secondaryText)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.78)
+                    if let secondaryText {
+                        Text(secondaryText)
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(status.level == .ready ? AppTheme.secondaryText : statusAccent)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
 
-                Text(messageText)
-                    .font(.system(size: 13, weight: .medium, design: .rounded))
-                    .foregroundStyle(AppTheme.secondaryText)
-                    .lineLimit(2)
-                    .minimumScaleFactor(0.82)
+                Spacer(minLength: 8)
+
+                refillIndicator
             }
-            .padding(16)
-            .frame(maxWidth: .infinity, minHeight: 128, alignment: .leading)
-            .background(cardBackground, in: RoundedRectangle(cornerRadius: 8))
-            .overlay {
-                RoundedRectangle(cornerRadius: 8)
-                    .strokeBorder(statusAccent.opacity(isHighlighted ? 0.62 : borderOpacity), lineWidth: isHighlighted ? 2 : 1)
-            }
+            .padding(14)
+            .frame(maxWidth: .infinity, minHeight: 56, alignment: .leading)
+            .medicationCardSurface(
+                .secondary,
+                borderTint: statusAccent,
+                borderOpacity: isHighlighted ? 0.62 : borderOpacity,
+                borderWidth: isHighlighted ? 2 : 1
+            )
             .scaleEffect(isHighlighted ? 1.018 : 1)
         }
         .buttonStyle(.plain)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilitySummary)
         .accessibilityHint("Opens refill options for this medication.")
+    }
+
+    /// "30 tablets left" · the dose count, which only says something new when a dose is
+    /// more than one tablet. The bottle above already carries the days-left number, so
+    /// repeating supply here would waste the row.
+    var rowSummaryText: String {
+        let tablets = "\(status.remainingCount) \(tabletLabel) left"
+        guard tabletsPerDose > 1 else { return tablets }
+
+        let doses = status.remainingDoses
+        return "\(tablets) · \(doses) \(doses == 1 ? "dose" : "doses") at \(tabletsPerDose) per dose"
+    }
+
+    /// When to act. A healthy bottle gets the day to reorder by; a low or empty one gets
+    /// the urgency it already computed.
+    var secondaryText: String? {
+        guard status.level == .ready else { return messageText }
+        guard let reorderByDate = status.reorderByDate else { return nil }
+
+        return "Order by \(reorderByDate.formatted(.dateTime.month().day())) to avoid running out"
     }
 
     var titleText: String {
@@ -1136,11 +1354,11 @@ struct MedicationStockCard: View {
             Image(systemName: "chevron.right")
                 .font(.system(size: 10, weight: .heavy))
         }
-        .font(.system(size: 12, weight: .bold, design: .rounded))
+        .font(.caption.weight(.bold))
         .foregroundStyle(statusAccent)
         .lineLimit(1)
         .padding(.horizontal, 9)
-        .frame(height: 26)
+        .frame(minHeight: 26)
         .background(statusAccent.opacity(0.11), in: Capsule())
     }
 
@@ -1160,9 +1378,9 @@ struct MedicationStockCard: View {
         case .ready:
             return tint
         case .low:
-            return Color(red: 0.72, green: 0.46, blue: 0.10)
+            return AppTheme.warning
         case .empty:
-            return Color(red: 0.72, green: 0.16, blue: 0.16)
+            return AppTheme.critical
         }
     }
 
@@ -1175,80 +1393,6 @@ struct MedicationStockCard: View {
         case .empty:
             return 0.46
         }
-    }
-
-    private var cardBackground: Color {
-        switch status.level {
-        case .ready:
-            return AppTheme.surfaceStrong
-        case .low, .empty:
-            return AppTheme.surfaceStrong
-        }
-    }
-}
-
-private struct MedicationReminderCard: View {
-    let overview: MedicationReminderOverview
-
-    var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: reminderIcon)
-                .font(.system(size: 17, weight: .bold))
-                .foregroundStyle(accentColor)
-                .frame(width: 34, height: 34)
-                .background(accentColor.opacity(0.10), in: Circle())
-                .accessibilityHidden(true)
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(reminderLabel)
-                    .font(.system(size: 13, weight: .semibold, design: .rounded))
-                    .foregroundStyle(AppTheme.secondaryText)
-                    .lineLimit(1)
-
-                Text(overview.activeCount > 0 ? "Reminder" : overview.subtitle)
-                    .font(.system(size: 12, weight: .medium, design: .rounded))
-                    .foregroundStyle(AppTheme.tertiaryText)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.78)
-            }
-
-            Spacer(minLength: 12)
-
-            Text(reminderTimeText)
-                .font(.system(size: 18, weight: .semibold, design: .rounded))
-                .foregroundStyle(AppTheme.primaryText)
-                .lineLimit(1)
-                .minimumScaleFactor(0.72)
-                .multilineTextAlignment(.trailing)
-        }
-        .padding(12)
-        .background(AppTheme.surface, in: RoundedRectangle(cornerRadius: 8))
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(reminderLabel), \(reminderTimeText)")
-    }
-
-    private var accentColor: Color {
-        overview.activeCount > 0 ? AppTheme.accent : AppTheme.tertiaryText
-    }
-
-    private var reminderIcon: String {
-        overview.activeCount > 0 ? "bell.fill" : "bell.slash.fill"
-    }
-
-    private var reminderLabel: String {
-        overview.activeCount > 0 ? "Next Dose" : "No Reminder"
-    }
-
-    private var reminderTimeText: String {
-        guard let nextReminderText = overview.nextReminderText else {
-            return "Not set"
-        }
-
-        if let separatorRange = nextReminderText.range(of: " at ", options: [.backwards]) {
-            return String(nextReminderText[separatorRange.upperBound...])
-        }
-
-        return nextReminderText.replacingOccurrences(of: "Next: ", with: "")
     }
 }
 
@@ -1263,14 +1407,14 @@ private struct RecentDoseRecordsCard: View {
             HStack(spacing: 8) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Dose History")
-                        .font(.system(size: 18, weight: .bold, design: .rounded))
+                        .font(.headline)
                         .foregroundStyle(AppTheme.primaryText)
+                        .fixedSize(horizontal: false, vertical: true)
 
                     Text(historySummaryText)
-                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .font(.caption.weight(.semibold))
                         .foregroundStyle(AppTheme.secondaryText)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.82)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
 
                 Spacer()
@@ -1298,7 +1442,7 @@ private struct RecentDoseRecordsCard: View {
 
             if records.isEmpty {
                 Text("No doses logged yet")
-                    .font(.system(size: 14, weight: .medium, design: .rounded))
+                    .font(.footnote.weight(.medium))
                     .foregroundStyle(AppTheme.secondaryText)
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else {
@@ -1315,7 +1459,7 @@ private struct RecentDoseRecordsCard: View {
             }
         }
         .padding(14)
-        .background(AppTheme.surface, in: RoundedRectangle(cornerRadius: 8))
+        .medicationCardSurface(.tertiary)
         .accessibilityElement(children: .contain)
     }
 
@@ -1345,20 +1489,18 @@ private struct RecentDoseTimelineRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Text(record.takenAt.formatted(date: .abbreviated, time: .omitted))
-                        .font(.system(size: 14, weight: .semibold, design: .rounded))
+                        .font(.footnote.weight(.semibold))
                         .foregroundStyle(AppTheme.primaryText)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.78)
+                        .fixedSize(horizontal: false, vertical: true)
 
                     Text(record.takenAt.formatted(date: .omitted, time: .shortened))
-                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .font(.caption.weight(.semibold))
                         .foregroundStyle(isFirst ? AppTheme.accent : AppTheme.secondaryText)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.8)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
 
                 Text("\(record.tabletCount) tablet\(record.tabletCount == 1 ? "" : "s")")
-                    .font(.system(size: 12, weight: .medium, design: .rounded))
+                    .font(.caption.weight(.medium))
                     .foregroundStyle(AppTheme.secondaryText)
             }
 
@@ -1418,10 +1560,16 @@ private struct MedicationDetailActionBar: View {
     private var primaryButton: some View {
         Button(action: primaryAction) {
             Label(actions.primaryTitle, systemImage: actions.primarySystemImage)
-                .font(.system(size: 17, weight: .bold, design: .rounded))
+                .font(.body.weight(.semibold))
                 .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
         }
-        .buttonStyle(LiquidGlassCapsuleButtonStyle(tint: primaryColor))
+        .buttonStyle(
+            LiquidGlassCapsuleButtonStyle(
+                tint: primaryColor,
+                isProminent: !(actions.canLogDose && actions.isDoseLoggedToday)
+            )
+        )
         .disabled(isLoading)
         .accessibilityLabel(actions.primaryTitle)
         .accessibilityHint(actions.canLogDose ? "Logs the scheduled dose for this medication." : "Opens refill options for this medication.")
@@ -1436,12 +1584,14 @@ private struct MedicationDetailLoadingCard: View {
                 .tint(AppTheme.accent)
 
             Text("Loading medication details")
-                .font(.system(size: 16, weight: .semibold, design: .rounded))
+                .font(.subheadline.weight(.semibold))
                 .foregroundStyle(AppTheme.primaryText)
+                .fixedSize(horizontal: false, vertical: true)
         }
+        .padding(20)
         .frame(maxWidth: .infinity)
-        .frame(height: 160)
-        .background(AppTheme.surface, in: RoundedRectangle(cornerRadius: 8))
+        .frame(minHeight: 160)
+        .medicationCardSurface(.secondary, borderOpacity: 0)
     }
 }
 
@@ -1453,17 +1603,17 @@ struct StatPill: View {
     var body: some View {
         VStack(spacing: 3) {
             Text(title)
-                .font(.system(size: 12, weight: .medium, design: .rounded))
+                .font(.caption.weight(.medium))
                 .foregroundStyle(titleColor)
             Text(value)
-                .font(.system(size: 17, weight: .bold, design: .rounded))
+                .font(.body.weight(.semibold))
                 .foregroundStyle(AppTheme.primaryText)
-                .lineLimit(1)
-                .minimumScaleFactor(0.75)
+                .fixedSize(horizontal: false, vertical: true)
         }
+        .padding(.vertical, 10)
         .frame(maxWidth: .infinity)
-        .frame(height: 62)
-        .background(AppTheme.surface, in: RoundedRectangle(cornerRadius: 8))
+        .frame(minHeight: 62)
+        .medicationCardSurface(.tertiary)
     }
 }
 
@@ -1475,17 +1625,17 @@ struct InfoCard: View {
     var body: some View {
         VStack(spacing: 3) {
             Text(title)
-                .font(.system(size: 12, weight: .medium, design: .rounded))
+                .font(.caption.weight(.medium))
                 .foregroundStyle(titleColor)
             Text(value)
-                .font(.system(size: 17, weight: .bold, design: .rounded))
+                .font(.body.weight(.semibold))
                 .foregroundStyle(AppTheme.primaryText)
-                .lineLimit(1)
-                .minimumScaleFactor(0.75)
+                .fixedSize(horizontal: false, vertical: true)
         }
+        .padding(.vertical, 10)
         .frame(maxWidth: .infinity)
-        .frame(height: 62)
-        .background(AppTheme.surface, in: RoundedRectangle(cornerRadius: 8))
+        .frame(minHeight: 62)
+        .medicationCardSurface(.tertiary)
     }
 }
 
@@ -1496,26 +1646,22 @@ struct RefillInfoCard: View {
     var body: some View {
         VStack(spacing: 3) {
             Text("Bottle")
-                .font(.system(size: 12, weight: .medium, design: .rounded))
+                .font(.caption.weight(.medium))
                 .foregroundStyle(titleColor)
 
             HStack(spacing: 6) {
                 Image(systemName: "arrow.triangle.2.circlepath")
                     .font(.system(size: 13, weight: .bold))
                 Text("Refill")
-                    .font(.system(size: 17, weight: .bold, design: .rounded))
+                    .font(.body.weight(.semibold))
             }
             .foregroundStyle(accentColor)
-            .lineLimit(1)
-            .minimumScaleFactor(0.75)
+            .fixedSize(horizontal: false, vertical: true)
         }
+        .padding(.vertical, 10)
         .frame(maxWidth: .infinity)
-        .frame(height: 62)
-        .background(AppTheme.surface, in: RoundedRectangle(cornerRadius: 8))
-        .overlay {
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(accentColor.opacity(0.36), lineWidth: 1)
-        }
+        .frame(minHeight: 62)
+        .medicationCardSurface(.tertiary, borderTint: accentColor, borderOpacity: 0.36)
     }
 }
 
@@ -1524,28 +1670,63 @@ struct EmptyMedicationView: View {
     var addAction: () -> Void
     var historyAction: () -> Void
 
+    /// An empty amber bottle — this is the one screen where showing the product sells it.
+    private var emptyBottle: Medication {
+        Medication(
+            id: UUID(),
+            name: "",
+            tabletsRemaining: 0,
+            tabletsPerDose: 1,
+            bottleColorHex: AppTheme.bottleColors[0],
+            lastTakenAt: nil,
+            bottleCapacity: 30
+        )
+    }
+
     var body: some View {
         VStack(spacing: 18) {
             Spacer()
-            Image(systemName: "pills.fill")
-                .font(.system(size: 62))
-                .foregroundStyle(AppTheme.accent)
-            Text("Add your first bottle")
-                .font(.system(size: 26, weight: .bold, design: .rounded))
-            Button("Add Medication", action: addAction)
-                .buttonStyle(.borderedProminent)
-                .accessibilityHint("Opens the form to add your first medication.")
+
+            BottleSceneView(medication: emptyBottle, isInteractive: false)
+                .frame(height: 180)
+                .frame(maxWidth: 260)
+                .accessibilityHidden(true)
+
+            VStack(spacing: 8) {
+                Text("Add your first bottle")
+                    .font(.title.weight(.bold))
+                    .foregroundStyle(AppTheme.primaryText)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Text("Track what's left, and never guess whether you've taken today's dose.")
+                    .font(.subheadline)
+                    .foregroundStyle(AppTheme.secondaryText)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Button(action: addAction) {
+                Label("Add Medication", systemImage: "plus")
+                    .font(.body.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+            }
+            .buttonStyle(LiquidGlassCapsuleButtonStyle(tint: AppTheme.accent))
+            .accessibilityHint("Opens the form to add your first medication.")
 
             if hasDoseHistory {
                 Button(action: historyAction) {
                     Label("View Dose History", systemImage: "clock.arrow.circlepath")
-                        .font(.system(size: 16, weight: .semibold, design: .rounded))
+                        .font(.subheadline.weight(.semibold))
                 }
                 .buttonStyle(.bordered)
                 .accessibilityLabel("View preserved dose history")
                 .accessibilityHint("Opens dose history from medications that may no longer be active.")
             }
+
             Spacer()
         }
+        .frame(maxWidth: 420)
     }
 }

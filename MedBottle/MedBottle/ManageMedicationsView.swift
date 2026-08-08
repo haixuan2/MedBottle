@@ -5,7 +5,7 @@ struct ManageMedicationsView: View {
     @EnvironmentObject private var store: MedicationStore
 
     @Binding var selectedMedicationID: Medication.ID?
-    @State private var reminderSelection: ReminderMedicationSelection?
+    @State private var pendingDeletion: Medication?
 
     var body: some View {
         NavigationStack {
@@ -18,137 +18,121 @@ struct ManageMedicationsView: View {
                     )
                 } else {
                     Section {
+                        // One row, one destination. Reminders are edited inside the editor.
                         ForEach(store.medications) { medication in
-                            HStack(spacing: 10) {
-                                NavigationLink {
-                                    MedicationEditorView(medication: medication)
-                                        .environmentObject(store)
+                            NavigationLink {
+                                MedicationEditorView(medication: medication)
+                                    .environmentObject(store)
+                            } label: {
+                                MedicationManagementRow(medication: medication)
+                            }
+                            .swipeActions(edge: .trailing) {
+                                Button(role: .destructive) {
+                                    pendingDeletion = medication
                                 } label: {
-                                    MedicationManagementRow(medication: medication)
-                                }
-
-                                ReminderStatusButton(medication: medication) {
-                                    reminderSelection = ReminderMedicationSelection(id: medication.id)
+                                    Label("Delete", systemImage: "trash")
                                 }
                             }
                         }
-                        .onDelete(perform: deleteMedications)
                     }
                 }
             }
             .navigationTitle("Manage Medications")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    if !store.medications.isEmpty {
-                        EditButton()
-                    }
-                }
-
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
                 }
             }
-            .sheet(item: $reminderSelection) { selection in
-                MedicationReminderManagementView(medicationID: selection.id)
-                    .environmentObject(store)
+            .confirmationDialog(
+                "Delete this medication?",
+                isPresented: Binding(
+                    get: { pendingDeletion != nil },
+                    set: { isPresented in
+                        if !isPresented { pendingDeletion = nil }
+                    }
+                ),
+                titleVisibility: .visible,
+                presenting: pendingDeletion
+            ) { medication in
+                Button("Delete \(medication.name)", role: .destructive) {
+                    delete(medication)
+                }
+                Button("Cancel", role: .cancel) {
+                    pendingDeletion = nil
+                }
+            } message: { _ in
+                Text("Dose history for this medication will be kept.")
             }
         }
     }
 
-    private func deleteMedications(at offsets: IndexSet) {
+    private func delete(_ medication: Medication) {
+        guard let index = store.medications.firstIndex(where: { $0.id == medication.id }) else {
+            pendingDeletion = nil
+            return
+        }
+
         selectedMedicationID = store.deleteMedications(
-            at: offsets,
+            at: IndexSet(integer: index),
             selectedID: selectedMedicationID
         )
+        pendingDeletion = nil
     }
-}
-
-private struct ReminderMedicationSelection: Identifiable {
-    let id: Medication.ID
 }
 
 private struct MedicationManagementRow: View {
     let medication: Medication
     private let primaryColor = AppTheme.accent
 
+    private var stockStatus: MedicationStockStatus {
+        MedicationDetailSnapshotBuilder().makeStockStatus(for: medication)
+    }
+
     var body: some View {
         HStack(spacing: 12) {
-            Circle()
-                .fill(Color(hex: medication.bottleColorHex))
-                .frame(width: 14, height: 14)
-                .accessibilityHidden(true)
+            MedicationBottleGauge(medication: medication, height: 36)
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(medication.name)
-                    .font(.system(size: 17, weight: .semibold, design: .rounded))
+                    .font(.body.weight(.semibold))
                     .foregroundStyle(AppTheme.primaryText)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.78)
+                    .fixedSize(horizontal: false, vertical: true)
 
-                Text("\(medication.medicationShape.title) • \(medication.classification.title)")
-                    .font(.system(size: 13, weight: .medium, design: .rounded))
+                Text(medication.classification.title)
+                    .font(.footnote.weight(.medium))
                     .foregroundStyle(.secondary)
 
-                Text(medication.remainingText)
-                    .font(.system(size: 13, weight: .bold, design: .rounded))
-                    .foregroundStyle(primaryColor)
+                Text(stockStatus.supplyHeadline)
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(stockStatus.level == .ready ? primaryColor : AppTheme.warning)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
-            Spacer()
+            Spacer(minLength: 8)
+
+            reminderLabel
         }
         .padding(.vertical, 4)
-    }
-}
-
-private struct ReminderStatusButton: View {
-    let medication: Medication
-    let action: () -> Void
-
-    private let primaryColor = AppTheme.accent
-
-    private var activeReminderCount: Int {
-        medication.reminders.filter { $0.isScheduled }.count
+        .accessibilityElement(children: .combine)
     }
 
-    var body: some View {
-        Button(action: action) {
-            VStack(spacing: 4) {
-                Image(systemName: activeReminderCount > 0 ? "bell.fill" : "bell.badge")
-                    .font(.system(size: 15, weight: .bold))
+    /// A label, not a second destination — reminders are edited inside the editor.
+    private var reminderLabel: some View {
+        let nextDate = medication.nextScheduledReminderDate
 
-                Text(statusText)
-                    .font(.system(size: 11, weight: .bold, design: .rounded))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.72)
-            }
-            .foregroundStyle(activeReminderCount > 0 ? .white : primaryColor)
-            .frame(width: 92)
-            .padding(.vertical, 8)
-            .background(
-                activeReminderCount > 0 ? primaryColor : primaryColor.opacity(0.10),
-                in: RoundedRectangle(cornerRadius: 8)
-            )
+        return Label {
+            Text(nextDate.map { $0.formatted(date: .omitted, time: .shortened) } ?? "No reminder")
+        } icon: {
+            Image(systemName: nextDate == nil ? "bell.slash" : "bell.fill")
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel(accessibilityText)
-    }
-
-    private var statusText: String {
-        guard let nextDate = medication.nextScheduledReminderDate else {
-            return "Add"
-        }
-
-        return "Next: \(nextDate.formatted(date: .omitted, time: .shortened))"
-    }
-
-    private var accessibilityText: String {
-        guard let nextDate = medication.nextScheduledReminderDate else {
-            return "Add reminder for \(medication.name)"
-        }
-
-        let nextTime = nextDate.formatted(date: .omitted, time: .shortened)
-        return "Manage reminders for \(medication.name). Next reminder at \(nextTime)"
+        .font(.footnote)
+        .foregroundStyle(AppTheme.secondaryText)
+        .labelStyle(.titleAndIcon)
+        .fixedSize(horizontal: false, vertical: true)
+        .accessibilityLabel(
+            nextDate.map { "Next reminder at \($0.formatted(date: .omitted, time: .shortened))" } ?? "No reminder"
+        )
     }
 }
 
@@ -162,12 +146,9 @@ private struct MedicationEditorView: View {
     @State private var tabletCount: Int
     @State private var doseCount: Int
     @State private var colorHex: String
-    @State private var customColor: Color
-    @State private var medicationShape: MedicationShape
     @State private var medicationClassification: MedicationClassification
     @State private var reminders: [Medication.Reminder]
 
-    private let colors = ["D99A00", "C87B00", "8FB7D8", "74A88D", "D35F7B"]
     private let primaryColor = AppTheme.accent
 
     init(medication: Medication) {
@@ -176,8 +157,6 @@ private struct MedicationEditorView: View {
         _tabletCount = State(initialValue: medication.tabletsRemaining)
         _doseCount = State(initialValue: medication.tabletsPerDose)
         _colorHex = State(initialValue: medication.bottleColorHex)
-        _customColor = State(initialValue: Color(hex: medication.bottleColorHex))
-        _medicationShape = State(initialValue: medication.medicationShape)
         _medicationClassification = State(initialValue: medication.classification)
         _reminders = State(initialValue: medication.reminders)
     }
@@ -190,15 +169,6 @@ private struct MedicationEditorView: View {
                     .autocorrectionDisabled()
                 Stepper("Tablets: \(tabletCount)", value: $tabletCount, in: 0...500)
                 Stepper("Per dose: \(doseCount)", value: $doseCount, in: 1...12)
-            }
-
-            Section("Medication Shape") {
-                Picker("Shape", selection: $medicationShape) {
-                    ForEach(MedicationShape.allCases) { shape in
-                        Text(shape.title).tag(shape)
-                    }
-                }
-                .pickerStyle(.segmented)
             }
 
             Section("Classification") {
@@ -217,32 +187,7 @@ private struct MedicationEditorView: View {
             )
 
             Section("Color") {
-                ColorPicker("Bottle color", selection: $customColor, supportsOpacity: false)
-                    .onChange(of: customColor) { _, newColor in
-                        colorHex = newColor.hexString
-                    }
-
-                HStack(spacing: 16) {
-                    ForEach(colors, id: \.self) { color in
-                        Button {
-                            colorHex = color
-                            customColor = Color(hex: color)
-                        } label: {
-                            Circle()
-                                .fill(Color(hex: color))
-                                .frame(width: 34, height: 34)
-                                .overlay {
-                                    if colorHex == color {
-                                        Image(systemName: "checkmark")
-                                            .font(.system(size: 13, weight: .bold))
-                                            .foregroundStyle(.white)
-                                    }
-                                }
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-                .padding(.vertical, 4)
+                BottleColorPicker(colorHex: $colorHex)
             }
         }
         .navigationTitle("Edit Medication")
@@ -266,10 +211,11 @@ private struct MedicationEditorView: View {
                 tabletsRemaining: tabletCount,
                 tabletsPerDose: doseCount,
                 bottleColorHex: colorHex,
-                medicationShape: medicationShape,
                 classification: medicationClassification,
                 reminders: reminders,
-                lastTakenAt: medication.lastTakenAt
+                lastTakenAt: medication.lastTakenAt,
+                bottleCapacity: medication.bottleCapacity,
+                rxcui: medication.rxcui
             )
         )
     }
@@ -280,53 +226,69 @@ private struct MedicationEditorView: View {
     }
 }
 
-private struct MedicationReminderManagementView: View {
-    @Environment(\.dismiss) private var dismiss
-    @EnvironmentObject private var store: MedicationStore
+/// The five curated bottle colours as one-tap presets, plus a full colour picker for
+/// anything else. Shared by Add and Edit.
+struct BottleColorPicker: View {
+    @Binding var colorHex: String
 
-    let medicationID: Medication.ID
+    /// A colour the presets do not cover is shown in its own well, so a custom bottle
+    /// still reads as the current selection rather than as "none of these".
+    private var isCustomColor: Bool {
+        !AppTheme.bottleColors.contains(colorHex.uppercased())
+    }
 
-    private var medication: Medication? {
-        store.medications.first { $0.id == medicationID }
+    private var customColor: Binding<Color> {
+        Binding(
+            get: { Color(hex: colorHex) },
+            set: { colorHex = $0.hexString }
+        )
     }
 
     var body: some View {
-        NavigationStack {
-            Form {
-                if let medication {
-                    MedicationReminderSection(
-                        medicationName: medication.name,
-                        dosageAmount: medication.tabletsPerDose,
-                        reminders: remindersBinding(for: medication)
-                    )
-                } else {
-                    ContentUnavailableView(
-                        "Medication unavailable",
-                        systemImage: "pills",
-                        description: Text("This medication may have been deleted.")
-                    )
+        HStack(spacing: 16) {
+            ForEach(AppTheme.bottleColors, id: \.self) { color in
+                Button {
+                    colorHex = color
+                } label: {
+                    swatch(Color(hex: color), isSelected: colorHex.uppercased() == color)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Bottle color \(color)")
+                .accessibilityAddTraits(colorHex.uppercased() == color ? [.isButton, .isSelected] : .isButton)
+            }
+
+            Spacer(minLength: 0)
+
+            ColorPicker(selection: customColor, supportsOpacity: false) {
+                EmptyView()
+            }
+            .labelsHidden()
+            .frame(width: 34, height: 34)
+            .overlay {
+                if isCustomColor {
+                    Circle()
+                        .strokeBorder(AppTheme.accent, lineWidth: 2)
+                        .frame(width: 40, height: 40)
+                        .allowsHitTesting(false)
                 }
             }
-            .navigationTitle("Reminders")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
-                }
-            }
+            .accessibilityLabel("Custom bottle color")
+            .accessibilityValue(colorHex)
         }
+        .padding(.vertical, 4)
     }
 
-    private func remindersBinding(for medication: Medication) -> Binding<[Medication.Reminder]> {
-        Binding {
-            store.medications.first { $0.id == medication.id }?.reminders ?? medication.reminders
-        } set: { reminders in
-            guard var updatedMedication = store.medications.first(where: { $0.id == medication.id }) else {
-                return
+    private func swatch(_ color: Color, isSelected: Bool) -> some View {
+        Circle()
+            .fill(color)
+            .frame(width: 34, height: 34)
+            .overlay {
+                if isSelected {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(.white)
+                }
             }
-            updatedMedication.reminders = reminders
-            store.updateMedication(updatedMedication)
-        }
     }
 }
 
@@ -342,7 +304,7 @@ struct MedicationReminderSection: View {
             if reminders.isEmpty {
                 VStack(alignment: .leading, spacing: 12) {
                     Label("No reminders set", systemImage: "bell.slash")
-                        .font(.system(size: 15, weight: .semibold, design: .rounded))
+                        .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.secondary)
 
                     addReminderLink(isProminent: true)
@@ -383,14 +345,14 @@ struct MedicationReminderSection: View {
                     Image(systemName: "chevron.right")
                         .font(.system(size: 12, weight: .bold))
                 }
-                .font(.system(size: 15, weight: .bold, design: .rounded))
+                .font(.subheadline.weight(.semibold))
                 .foregroundStyle(.white)
                 .padding(.vertical, 11)
                 .padding(.horizontal, 12)
                 .background(primaryColor, in: RoundedRectangle(cornerRadius: 8))
             } else {
                 Label("Add Reminder", systemImage: "bell.badge")
-                    .font(.system(size: 15, weight: .semibold, design: .rounded))
+                    .font(.subheadline.weight(.semibold))
                     .foregroundStyle(primaryColor)
             }
         }
@@ -419,17 +381,17 @@ private struct ReminderSummaryRow: View {
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(reminder.time.formatted(date: .omitted, time: .shortened))
-                    .font(.system(size: 16, weight: .semibold, design: .rounded))
+                    .font(.subheadline.weight(.semibold))
 
                 Text(summaryText)
-                    .font(.system(size: 13, weight: .medium, design: .rounded))
+                    .font(.footnote.weight(.medium))
                     .foregroundStyle(.secondary)
             }
 
             Spacer()
 
             Text("\(reminder.dosageAmount)")
-                .font(.system(size: 14, weight: .bold, design: .rounded))
+                .font(.footnote.weight(.semibold))
                 .foregroundStyle(primaryColor)
         }
         .padding(.vertical, 3)
@@ -636,10 +598,10 @@ private struct WeekdayPicker: View {
                     toggle(weekday)
                 } label: {
                     Text(weekday.shortTitle)
-                        .font(.system(size: 12, weight: .bold, design: .rounded))
+                        .font(.caption.weight(.semibold))
                         .foregroundStyle(selectedWeekdays.contains(weekday) ? .white : primaryColor)
                         .frame(maxWidth: .infinity)
-                        .frame(height: 34)
+                        .frame(minHeight: 34)
                         .background(
                             selectedWeekdays.contains(weekday) ? primaryColor : primaryColor.opacity(0.10),
                             in: RoundedRectangle(cornerRadius: 8)

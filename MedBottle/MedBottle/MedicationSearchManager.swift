@@ -3,14 +3,12 @@ import Foundation
 struct MedicationSearchResult: Identifiable, Equatable, Sendable {
     let rxcui: String
     let name: String
-    let shape: MedicationShape
 
     var id: String { rxcui }
 }
 
 struct MedicationSelectionDetails: Equatable, Sendable {
     let name: String
-    let shape: MedicationShape
     let classification: MedicationClassification
 }
 
@@ -121,7 +119,6 @@ final class MedicationSearchManager: ObservableObject {
         } catch {
             return MedicationSelectionDetails(
                 name: result.name,
-                shape: result.shape,
                 classification: .prescription
             )
         }
@@ -195,11 +192,7 @@ actor RxNavMedicationSearchService: MedicationSearchServicing {
             let products = try await drugs(for: name)
             if products.isEmpty {
                 results.append(
-                    MedicationSearchResult(
-                        rxcui: rxcui,
-                        name: name,
-                        shape: MedicationShape.fromRxNormText(name)
-                    )
+                    MedicationSearchResult(rxcui: rxcui, name: name)
                 )
             } else {
                 for product in products {
@@ -295,11 +288,7 @@ actor RxNavMedicationSearchService: MedicationSearchServicing {
             return nil
         }
 
-        return MedicationSearchResult(
-            rxcui: rxcui,
-            name: name,
-            shape: MedicationShape.fromRxNormText(name)
-        )
+        return MedicationSearchResult(rxcui: rxcui, name: name)
     }
 
     private func medicationResult(from candidate: RxNormCandidate) -> MedicationSearchResult? {
@@ -307,35 +296,16 @@ actor RxNavMedicationSearchService: MedicationSearchServicing {
             return nil
         }
 
-        return MedicationSearchResult(
-            rxcui: rxcui,
-            name: name,
-            shape: MedicationShape.fromRxNormText(name)
-        )
+        return MedicationSearchResult(rxcui: rxcui, name: name)
     }
 
     func details(for result: MedicationSearchResult) async throws -> MedicationSelectionDetails {
-        async let properties = rxNormProperties(for: result.rxcui)
-        async let classification = classification(for: result.rxcui)
-
-        let propertyText = try await properties.joined(separator: " ")
-        let detectedClassification = await classification ?? .prescription
-        let shape = MedicationShape.fromRxNormText([result.name, propertyText].joined(separator: " "))
+        let detectedClassification = await classification(for: result.rxcui) ?? .prescription
 
         return MedicationSelectionDetails(
             name: result.name,
-            shape: shape,
             classification: detectedClassification
         )
-    }
-
-    private func rxNormProperties(for rxcui: String) async throws -> [String] {
-        guard let url = rxNavURL(path: "rxcui/\(rxcui)/allProperties.json", queryItems: [("prop", "all")]) else { return [] }
-
-        let response = try await decodedResponse(RxNormPropertiesResponse.self, from: url)
-        return response.propConceptGroup?.propConcept?.flatMap { property in
-            [property.propName, property.propValue].compactMap { $0 }
-        } ?? []
     }
 
     private func classification(for rxcui: String) async -> MedicationClassification? {
@@ -413,37 +383,6 @@ private extension URLSession {
     }
 }
 
-extension MedicationShape {
-    static func fromRxNormText(_ text: String) -> MedicationShape {
-        let normalized = text.lowercased()
-
-        if normalized.contains("softgel")
-            || normalized.contains("soft gel")
-            || normalized.contains("gelcap")
-            || normalized.contains("gel cap")
-            || normalized.contains("liquid filled capsule")
-            || normalized.contains("liquid-filled capsule") {
-            return .softgel
-        }
-
-        if normalized.contains("capsule") {
-            return .capsule
-        }
-
-        if normalized.contains("tablet")
-            || normalized.contains("caplet")
-            || normalized.contains("chewable")
-            || normalized.contains("orally disintegrating") {
-            return .tablet
-        }
-
-        if normalized.contains("pill") || normalized.contains("pellet") {
-            return .pill
-        }
-
-        return .tablet
-    }
-}
 
 private struct RxNormApproximateResponse: Decodable {
     let approximateGroup: RxNormApproximateGroup?
@@ -501,19 +440,6 @@ private struct RxNormConceptProperty: Decodable, CustomStringConvertible {
     var description: String {
         "RxNormConceptProperty(rxcui: \(rxcui ?? "nil"), name: \(name ?? "nil"), tty: \(tty ?? "nil"))"
     }
-}
-
-private struct RxNormPropertiesResponse: Decodable {
-    let propConceptGroup: RxNormPropertyConceptGroup?
-}
-
-private struct RxNormPropertyConceptGroup: Decodable {
-    let propConcept: [RxNormPropertyConcept]?
-}
-
-private struct RxNormPropertyConcept: Decodable {
-    let propName: String?
-    let propValue: String?
 }
 
 private struct OpenFDALabelResponse: Decodable {

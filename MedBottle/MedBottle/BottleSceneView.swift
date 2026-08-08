@@ -1,12 +1,29 @@
 @preconcurrency import SceneKit
 import SwiftUI
 
+/// Pill silhouettes the scene can mould. Medications no longer carry a shape — every
+/// bottle renders `.tablet` — but the geometry stays parameterised so each silhouette
+/// keeps its own containment coverage.
+enum MedicationShape: String, CaseIterable, Identifiable, Sendable {
+    case tablet
+    case pill
+    case capsule
+    case softgel
+
+    /// What a bottle renders unless a caller asks for a specific silhouette.
+    static let `default` = MedicationShape.tablet
+
+    var id: String { rawValue }
+}
+
 @MainActor
 struct BottleSceneView: UIViewRepresentable {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     let medication: Medication
+    /// Peek bottles are decorative: no rotation gesture and no idle playback.
+    var isInteractive = true
     var onInteractionBegan: () -> Void = {}
 
     func makeCoordinator() -> Coordinator {
@@ -33,9 +50,12 @@ struct BottleSceneView: UIViewRepresentable {
         view.scene = scene
         context.coordinator.sceneView = view
         context.coordinator.renderedState = SceneRenderState(medication: medication, colorScheme: colorScheme)
-        if BottleSceneMotionPolicy.shouldAutoPlay(reduceMotion: reduceMotion) {
+        if isInteractive, BottleSceneMotionPolicy.shouldAutoPlay(reduceMotion: reduceMotion) {
             context.coordinator.playTemporarily()
         }
+        context.coordinator.scheduleLightingSettle()
+
+        guard isInteractive else { return view }
 
         let pan = UIPanGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handlePan(_:)))
         pan.maximumNumberOfTouches = 1
@@ -65,9 +85,10 @@ struct BottleSceneView: UIViewRepresentable {
                 reduceMotion: reduceMotion
             )
             context.coordinator.renderedState = nextState
-            if BottleSceneMotionPolicy.shouldAutoPlay(reduceMotion: reduceMotion) {
+            if isInteractive, BottleSceneMotionPolicy.shouldAutoPlay(reduceMotion: reduceMotion) {
                 context.coordinator.playTemporarily()
             }
+            context.coordinator.scheduleLightingSettle()
         }
         context.coordinator.sceneView = view
     }
@@ -81,11 +102,27 @@ struct BottleSceneView: UIViewRepresentable {
         private var gestureStartRotation: Float = 0
         private var previousInteractiveRotation: Float = 0
         private var playbackStopTask: Task<Void, Never>?
+        private var lightingSettleTask: Task<Void, Never>?
         private var reduceMotion = false
         private var onInteractionBegan: () -> Void = {}
 
         deinit {
             playbackStopTask?.cancel()
+            lightingSettleTask?.cancel()
+        }
+
+        /// The HDR lighting environment decodes off the main thread, so a scene that
+        /// stops playing before the decode lands can freeze on an unlit — visibly dark —
+        /// frame. Nudge a few redraws so the last frame on screen is always the lit one.
+        func scheduleLightingSettle() {
+            lightingSettleTask?.cancel()
+            lightingSettleTask = Task { [weak self] in
+                for delay in [0.25, 0.5, 1.0, 2.0] {
+                    try? await Task.sleep(for: .seconds(delay))
+                    guard !Task.isCancelled else { return }
+                    self?.sceneView?.setNeedsDisplay()
+                }
+            }
         }
 
         @objc func handlePan(_ recognizer: UIPanGestureRecognizer) {
@@ -167,8 +204,8 @@ struct BottleSceneView: UIViewRepresentable {
         let name: String
         let tabletsRemaining: Int
         let tabletsPerDose: Int
+        let bottleCapacity: Int
         let bottleColorHex: String
-        let medicationShape: MedicationShape
         let colorScheme: ColorScheme
 
         init(medication: Medication, colorScheme: ColorScheme) {
@@ -176,10 +213,35 @@ struct BottleSceneView: UIViewRepresentable {
             name = medication.name
             tabletsRemaining = medication.tabletsRemaining
             tabletsPerDose = medication.tabletsPerDose
+            bottleCapacity = medication.bottleCapacity
             bottleColorHex = medication.bottleColorHex
-            medicationShape = medication.medicationShape
             self.colorScheme = colorScheme
         }
+    }
+}
+
+/// The bottle is the app's supply gauge: the number of pills rendered tracks how full
+/// the bottle is relative to its capacity, not the raw tablet count.
+enum BottleFillPolicy {
+    /// Physics ceiling — more bodies than this cost more than they communicate.
+    static let maxVisiblePillCount = 18
+
+    static func visiblePillCount(tabletsRemaining: Int, bottleCapacity: Int) -> Int {
+        guard tabletsRemaining > 0 else { return 0 }
+
+        let capacity = max(1, bottleCapacity)
+        let ratio = min(1, Double(tabletsRemaining) / Double(capacity))
+        let scaled = Int((ratio * Double(maxVisiblePillCount)).rounded())
+
+        // A bottle with tablets in it must never render as empty.
+        return min(maxVisiblePillCount, max(1, scaled))
+    }
+
+    static func visiblePillCount(for medication: Medication) -> Int {
+        visiblePillCount(
+            tabletsRemaining: medication.tabletsRemaining,
+            bottleCapacity: medication.bottleCapacity
+        )
     }
 }
 
@@ -288,14 +350,12 @@ enum BottleSceneFactory {
         let name: String
         let tabletsRemaining: Int
         let tabletsPerDose: Int
-        let medicationShape: MedicationShape
 
         init(medication: Medication) {
             id = medication.id
             name = medication.name
             tabletsRemaining = medication.tabletsRemaining
             tabletsPerDose = medication.tabletsPerDose
-            medicationShape = medication.medicationShape
         }
     }
 
@@ -317,7 +377,12 @@ enum BottleSceneFactory {
         }
     }
 
-    static func scene(for medication: Medication, colorScheme: ColorScheme, reduceMotion: Bool) -> SCNScene {
+    static func scene(
+        for medication: Medication,
+        shape: MedicationShape = .default,
+        colorScheme: ColorScheme,
+        reduceMotion: Bool
+    ) -> SCNScene {
         let lighting = LightingProfile.profile(for: colorScheme)
         let scene = SCNScene()
         scene.physicsWorld.gravity = SCNVector3(0, -9.8, 0)
@@ -345,14 +410,20 @@ enum BottleSceneFactory {
 
         assembly.addChildNode(collisionEnvelopeNode())
 
-        let tablets = tabletsNode(count: medication.tabletsRemaining, shape: medication.medicationShape)
+        let tablets = tabletsNode(count: BottleFillPolicy.visiblePillCount(for: medication), shape: shape)
         assembly.addChildNode(tablets)
 
-        update(scene: scene, medication: medication, colorScheme: colorScheme, reduceMotion: reduceMotion)
+        update(scene: scene, medication: medication, shape: shape, colorScheme: colorScheme, reduceMotion: reduceMotion)
         return scene
     }
 
-    static func update(scene: SCNScene?, medication: Medication, colorScheme: ColorScheme, reduceMotion: Bool) {
+    static func update(
+        scene: SCNScene?,
+        medication: Medication,
+        shape: MedicationShape = .default,
+        colorScheme: ColorScheme,
+        reduceMotion: Bool
+    ) {
         guard let scene else { return }
         updateLighting(in: scene, colorScheme: colorScheme)
         guard let assembly = scene.rootNode.childNode(withName: NodeName.assembly, recursively: false) else { return }
@@ -374,15 +445,15 @@ enum BottleSceneFactory {
         }
 
         if let tablets = tabletGroup(in: assembly) {
-            if tablets.name != tabletGroupName(shape: medication.medicationShape) {
+            if tablets.name != tabletGroupName(shape: shape) {
                 tablets.removeFromParentNode()
-                let newTablets = tabletsNode(count: medication.tabletsRemaining, shape: medication.medicationShape)
+                let newTablets = tabletsNode(count: BottleFillPolicy.visiblePillCount(for: medication), shape: shape)
                 assembly.addChildNode(newTablets)
             } else {
                 reconcileTabletCount(
                     in: tablets,
-                    count: medication.tabletsRemaining,
-                    shape: medication.medicationShape,
+                    count: BottleFillPolicy.visiblePillCount(for: medication),
+                    shape: shape,
                     animated: BottleSceneMotionPolicy.shouldAnimateInventoryChange(reduceMotion: reduceMotion)
                 )
             }
@@ -459,7 +530,11 @@ enum BottleSceneFactory {
 
     private static func applyLightingEnvironment(to scene: SCNScene, colorScheme: ColorScheme) {
         let lighting = LightingProfile.profile(for: colorScheme)
-        if let environmentURL = Bundle.main.url(forResource: "studio_lighting", withExtension: "hdr") {
+        // SceneKit decodes the HDR asynchronously each time this is assigned. Only the
+        // intensity varies by colour scheme, so assign the map once per scene and let
+        // every later update just retune intensity.
+        if scene.lightingEnvironment.contents == nil,
+           let environmentURL = Bundle.main.url(forResource: "studio_lighting", withExtension: "hdr") {
             scene.lightingEnvironment.contents = environmentURL
         }
         scene.lightingEnvironment.intensity = lighting.environment
@@ -954,7 +1029,7 @@ enum BottleSceneFactory {
         let group = SCNNode()
         group.name = tabletGroupName(shape: shape)
 
-        let visibleCount = min(count, 18)
+        let visibleCount = min(count, BottleFillPolicy.maxVisiblePillCount)
         guard visibleCount > 0 else { return group }
 
         for index in 0..<visibleCount {
@@ -965,7 +1040,7 @@ enum BottleSceneFactory {
     }
 
     private static func reconcileTabletCount(in group: SCNNode, count: Int, shape: MedicationShape, animated: Bool) {
-        let targetCount = min(count, 18)
+        let targetCount = min(count, BottleFillPolicy.maxVisiblePillCount)
         let activePills = group.childNodes.filter { $0.name == NodeName.pill }
 
         if activePills.count > targetCount {
@@ -1278,7 +1353,9 @@ enum BottleSceneFactory {
 
             let quantity = "QTY \(medication.tabletsRemaining)"
             let dose = "DOSE \(medication.tabletsPerDose)"
-            let shape = medication.medicationShape.title.uppercased()
+            // Was the pill shape; the label keeps a third line, now the one fact a real
+            // pharmacy label would carry here.
+            let classification = medication.classification.title.uppercased()
 
             cgContext.setStrokeColor(rule.cgColor)
             cgContext.setLineWidth(2)
@@ -1305,7 +1382,7 @@ enum BottleSceneFactory {
                 ]
             )
 
-            (shape as NSString).draw(
+            (classification as NSString).draw(
                 in: CGRect(x: 40, y: 398, width: size.width - 80, height: 30),
                 withAttributes: [
                     .font: UIFont.systemFont(ofSize: 22, weight: .medium),

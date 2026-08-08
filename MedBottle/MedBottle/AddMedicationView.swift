@@ -9,90 +9,62 @@ struct AddMedicationView: View {
     @State private var name = ""
     @State private var searchText = ""
     @State private var selectedRXCUI: String?
+    /// Once the user edits the name themselves, a late lookup must not overwrite it.
+    @State private var hasEditedName = false
     @State private var tabletQuantity = MedicationQuantityInputConfiguration.tabletCount.makeState(value: 30)
     @State private var doseQuantity = MedicationQuantityInputConfiguration.doseCount.makeState(value: 1)
-    @State private var colorHex = "D99A00"
-    @State private var customColor = Color(hex: "D99A00")
-    @State private var medicationShape: MedicationShape = .tablet
+    @State private var colorHex = AppTheme.bottleColors[0]
     @State private var medicationClassification: MedicationClassification = .prescription
     @State private var reminders: [Medication.Reminder] = []
+    @State private var isShowingMoreOptions = false
+    @State private var addedMedication: Medication?
+    @FocusState private var focusedField: Field?
 
-    private let colors = ["D99A00", "C87B00", "8FB7D8", "74A88D", "D35F7B"]
+    private enum Field: Hashable {
+        case search
+        case name
+    }
 
     var body: some View {
         NavigationStack {
             Form {
                 Section("Bottle") {
                     medicationSearchField
+                    nameField
                     MedicationQuantityInputRow(
                         title: "Tablets",
                         quantity: $tabletQuantity
                     )
-                    MedicationQuantityInputRow(
-                        title: "Per dose",
-                        quantity: $doseQuantity
-                    )
                 }
 
-                Section("Medication Shape") {
-                    Picker("Shape", selection: $medicationShape) {
-                        ForEach(MedicationShape.allCases) { shape in
-                            Text(shape.title).tag(shape)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                }
+                Section {
+                    DisclosureGroup("More options", isExpanded: $isShowingMoreOptions) {
+                        MedicationQuantityInputRow(
+                            title: "Per dose",
+                            quantity: $doseQuantity
+                        )
 
-                Section("Classification") {
-                    Picker("Classification", selection: $medicationClassification) {
-                        ForEach(MedicationClassification.allCases) { classification in
-                            Text(classification.title).tag(classification)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-
-                    if searchManager.isResolvingSelection {
-                        HStack(spacing: 10) {
-                            ProgressView()
-                            Text("Checking classification")
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
-
-                MedicationReminderSection(
-                    medicationName: reminderMedicationName,
-                    dosageAmount: doseQuantity.value ?? MedicationQuantityLimits.doseCount.lowerBound,
-                    reminders: $reminders
-                )
-
-                Section("Color") {
-                    ColorPicker("Bottle color", selection: $customColor, supportsOpacity: false)
-                        .onChange(of: customColor) { _, newColor in
-                            colorHex = newColor.hexString
-                        }
-
-                    HStack(spacing: 16) {
-                        ForEach(colors, id: \.self) { color in
-                            Button {
-                                colorHex = color
-                                customColor = Color(hex: color)
-                            } label: {
-                                Circle()
-                                    .fill(Color(hex: color))
-                                    .frame(width: 34, height: 34)
-                                    .overlay {
-                                        if colorHex == color {
-                                            Image(systemName: "checkmark")
-                                                .font(.system(size: 13, weight: .bold))
-                                                .foregroundStyle(.white)
-                                        }
-                                    }
+                        Picker("Classification", selection: $medicationClassification) {
+                            ForEach(MedicationClassification.allCases) { classification in
+                                Text(classification.title).tag(classification)
                             }
-                            .buttonStyle(.plain)
+                        }
+
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Bottle color")
+                            BottleColorPicker(colorHex: $colorHex)
                         }
                     }
-                    .padding(.vertical, 4)
+                } footer: {
+                    Text("Classification is filled in automatically when you pick a search result.")
+                }
+
+                if isShowingMoreOptions {
+                    MedicationReminderSection(
+                        medicationName: reminderMedicationName,
+                        dosageAmount: doseQuantity.value ?? MedicationQuantityLimits.doseCount.lowerBound,
+                        reminders: $reminders
+                    )
                 }
             }
             .navigationTitle("New Medication")
@@ -101,35 +73,23 @@ struct AddMedicationView: View {
                     Button("Cancel") { dismiss() }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Add") {
-                        store.addMedication(
-                            name: name,
-                            tablets: tabletQuantity.value ?? MedicationQuantityLimits.tabletCount.lowerBound,
-                            dose: doseQuantity.value ?? MedicationQuantityLimits.doseCount.lowerBound,
-                            colorHex: colorHex,
-                            shape: medicationShape,
-                            classification: medicationClassification,
-                            reminders: reminders
-                        )
-                        dismiss()
-                    }
-                    .disabled(!canAddMedication)
+                    Button("Add", action: addMedication)
+                        .disabled(!canAddMedication)
                 }
+            }
+            .sheet(item: $addedMedication) { medication in
+                ReminderFollowUpPrompt(medication: medication) {
+                    addedMedication = nil
+                    dismiss()
+                }
+                .environmentObject(store)
             }
         }
     }
 
-    private var canAddMedication: Bool {
-        !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
-        tabletQuantity.isValid &&
-        doseQuantity.isValid
-    }
+    // MARK: - Name and search
 
-    private var reminderMedicationName: String {
-        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmedName.isEmpty ? "Medication" : trimmedName
-    }
-
+    /// Search returns a *selection*; it no longer writes straight into `name`.
     private var medicationSearchField: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
@@ -138,22 +98,54 @@ struct AddMedicationView: View {
                 TextField("Search medication", text: $searchText)
                     .textInputAutocapitalization(.words)
                     .autocorrectionDisabled()
+                    .focused($focusedField, equals: .search)
                     .onChange(of: searchText) { _, newValue in
-                        let trimmedText = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
-
-                        if selectedRXCUI != nil && trimmedText == name {
-                            return
-                        }
-
-                        selectedRXCUI = nil
-                        name = newValue
                         searchManager.scheduleSearch(for: newValue)
                     }
+
+                if !searchText.isEmpty {
+                    Button {
+                        searchText = ""
+                        searchManager.clearResults()
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.tertiary)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Clear search")
+                }
             }
 
             searchResults
         }
         .padding(.vertical, 2)
+    }
+
+    private var nameField: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 10) {
+                TextField("Name", text: $name)
+                    .textInputAutocapitalization(.words)
+                    .autocorrectionDisabled()
+                    .focused($focusedField, equals: .name)
+                    .onChange(of: name) { _, _ in
+                        if focusedField == .name {
+                            hasEditedName = true
+                        }
+                    }
+
+                if searchManager.isResolvingSelection {
+                    ProgressView()
+                        .accessibilityLabel("Looking up medication details")
+                }
+            }
+
+            if showsNameRequirement {
+                Text("Enter a name for this medication.")
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+            }
+        }
     }
 
     @ViewBuilder
@@ -174,13 +166,10 @@ struct AddMedicationView: View {
                         HStack(spacing: 12) {
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(result.name)
-                                    .font(.system(size: 15, weight: .semibold, design: .rounded))
+                                    .font(.subheadline.weight(.semibold))
                                     .foregroundStyle(AppTheme.primaryText)
                                     .lineLimit(2)
                                     .multilineTextAlignment(.leading)
-                                Text(result.shape.title)
-                                    .font(.system(size: 12, weight: .medium, design: .rounded))
-                                    .foregroundStyle(.secondary)
                             }
 
                             Spacer()
@@ -201,7 +190,7 @@ struct AddMedicationView: View {
             .transition(.opacity.combined(with: .move(edge: .top)))
         } else if let message = searchManager.message {
             Text(message)
-                .font(.system(size: 14, weight: .medium, design: .rounded))
+                .font(.footnote.weight(.medium))
                 .foregroundStyle(.secondary)
                 .transition(.opacity)
         }
@@ -209,19 +198,118 @@ struct AddMedicationView: View {
 
     private func select(_ result: MedicationSearchResult) {
         selectedRXCUI = result.rxcui
+        hasEditedName = false
         name = result.name
-        searchText = result.name
-        medicationShape = result.shape
+        searchText = ""
         searchManager.clearResults()
+        focusedField = nil
 
         Task {
             let details = await searchManager.details(for: result)
+            // Never clobber a field the user has since edited, or a newer selection.
             guard selectedRXCUI == result.rxcui else { return }
-            name = details.name
-            searchText = details.name
-            medicationShape = details.shape
+            if !hasEditedName {
+                name = details.name
+            }
             medicationClassification = details.classification
         }
+    }
+
+    // MARK: - Validation and add
+
+    private var trimmedName: String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var canAddMedication: Bool {
+        !trimmedName.isEmpty && tabletQuantity.isValid && doseQuantity.isValid
+    }
+
+    /// Surfaced under the offending row rather than left to a greyed-out Add button.
+    private var showsNameRequirement: Bool {
+        trimmedName.isEmpty && (hasEditedName || !searchText.isEmpty)
+    }
+
+    private var reminderMedicationName: String {
+        trimmedName.isEmpty ? "Medication" : trimmedName
+    }
+
+    private func addMedication() {
+        guard canAddMedication else { return }
+
+        let medication = store.addMedication(
+            name: name,
+            tablets: tabletQuantity.value ?? MedicationQuantityLimits.tabletCount.lowerBound,
+            dose: doseQuantity.value ?? MedicationQuantityLimits.doseCount.lowerBound,
+            colorHex: colorHex,
+            classification: medicationClassification,
+            reminders: reminders,
+            rxcui: selectedRXCUI
+        )
+
+        // Ask about a reminder only when none was set in the form.
+        if let medication, reminders.isEmpty {
+            addedMedication = medication
+        } else {
+            dismiss()
+        }
+    }
+}
+
+/// Asked once, right after the bottle is added — the only moment a reminder request
+/// has obvious context. Notification permission is requested from here, not at launch.
+private struct ReminderFollowUpPrompt: View {
+    @EnvironmentObject private var store: MedicationStore
+
+    let medication: Medication
+    var onFinish: () -> Void
+
+    @State private var reminders: [Medication.Reminder] = []
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Set a reminder for \(medication.name)?")
+                            .font(.headline)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        Text("A reminder is what turns the bottle count into an answer about today.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(.vertical, 6)
+                }
+
+                MedicationReminderSection(
+                    medicationName: medication.name,
+                    dosageAmount: medication.tabletsPerDose,
+                    reminders: $reminders
+                )
+            }
+            .navigationTitle("Reminder")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Not now", action: onFinish)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Set reminder") {
+                        save()
+                        onFinish()
+                    }
+                    .disabled(reminders.isEmpty)
+                }
+            }
+        }
+    }
+
+    private func save() {
+        guard var updated = store.medications.first(where: { $0.id == medication.id }) else { return }
+        updated.reminders = reminders
+        store.updateMedication(updated)
     }
 }
 
@@ -268,7 +356,7 @@ struct MedicationQuantityInputRow: View {
                         .keyboardType(.numberPad)
                         .multilineTextAlignment(.center)
                         .textFieldStyle(.roundedBorder)
-                        .frame(width: 76)
+                        .frame(minWidth: 76)
                         .focused($isFocused)
                         .accessibilityLabel("\(title) quantity")
                         .accessibilityValue(quantity.accessibilityValue)
@@ -298,6 +386,14 @@ struct MedicationQuantityInputRow: View {
                     .font(.footnote)
                     .foregroundStyle(.red)
                     .accessibilityLabel("\(title) error: \(errorMessage)")
+            }
+        }
+        .toolbar {
+            // The number pad has no return key; without this the field cannot be dismissed.
+            ToolbarItemGroup(placement: .keyboard) {
+                Spacer()
+                Button("Done") { isFocused = false }
+                    .disabled(!isFocused)
             }
         }
         .accessibilityElement(children: .contain)

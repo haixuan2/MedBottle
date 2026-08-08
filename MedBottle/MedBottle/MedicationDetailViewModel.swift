@@ -246,11 +246,23 @@ final class MedicationSelectionViewModel: ObservableObject {
     }
 }
 
+/// Everything undo needs, captured at log time.
+struct MedicationDoseLogResult: Equatable, Sendable {
+    var medication: Medication
+    var record: DoseRecord
+    var previousTabletsRemaining: Int
+}
+
 @MainActor
 protocol MedicationDetailRepository {
     func medication(id: Medication.ID) async throws -> Medication
     func doseRecords(forMedicationID medicationID: Medication.ID) async throws -> [DoseRecord]
-    func logDose(medicationID: Medication.ID, dosageAmount: Int, takenAt: Date) async throws -> Medication
+    func logDose(medicationID: Medication.ID, dosageAmount: Int, takenAt: Date) async throws -> MedicationDoseLogResult
+    func undoDose(
+        medicationID: Medication.ID,
+        recordID: DoseRecord.ID,
+        restoringTabletsTo count: Int
+    ) async throws -> Medication
     func refill(medicationID: Medication.ID, to count: Int) async throws -> Medication
 }
 
@@ -267,13 +279,20 @@ final class MedicationStoreDetailRepository: MedicationDetailRepository {
     }
 
     func doseRecords(forMedicationID medicationID: Medication.ID) async throws -> [DoseRecord] {
-        guard let store else { throw MedicationDetailError.storeUnavailable }
+        guard store != nil else { throw MedicationDetailError.storeUnavailable }
+        return currentDoseRecords(forMedicationID: medicationID)
+    }
+
+    /// The same read without the suspension. The store is in memory, so a screen being
+    /// built can have its records now rather than one runloop turn from now.
+    func currentDoseRecords(forMedicationID medicationID: Medication.ID) -> [DoseRecord] {
+        guard let store else { return [] }
         return store.doseRecords
             .filter { $0.medicationID == medicationID }
             .sorted { $0.takenAt > $1.takenAt }
     }
 
-    func logDose(medicationID: Medication.ID, dosageAmount: Int, takenAt: Date = Date()) async throws -> Medication {
+    func logDose(medicationID: Medication.ID, dosageAmount: Int, takenAt: Date = Date()) async throws -> MedicationDoseLogResult {
         guard let store else { throw MedicationDetailError.storeUnavailable }
         let medication = try currentMedication(id: medicationID)
 
@@ -281,10 +300,33 @@ final class MedicationStoreDetailRepository: MedicationDetailRepository {
             throw MedicationDetailError.outOfStock
         }
 
-        store.logDose(
+        guard let record = store.logDose(
             forMedicationID: medicationID,
             dosageAmount: max(1, dosageAmount),
             takenAt: takenAt
+        ) else {
+            throw MedicationDetailError.medicationNotFound
+        }
+
+        return MedicationDoseLogResult(
+            medication: try currentMedication(id: medicationID),
+            record: record,
+            previousTabletsRemaining: medication.tabletsRemaining
+        )
+    }
+
+    func undoDose(
+        medicationID: Medication.ID,
+        recordID: DoseRecord.ID,
+        restoringTabletsTo count: Int
+    ) async throws -> Medication {
+        guard let store else { throw MedicationDetailError.storeUnavailable }
+        _ = try currentMedication(id: medicationID)
+
+        store.undoDose(
+            medicationID: medicationID,
+            recordID: recordID,
+            restoringTabletsTo: count
         )
         return try currentMedication(id: medicationID)
     }
@@ -366,6 +408,10 @@ final class MedicationDetailViewModel: ObservableObject {
     @Published private(set) var refillQuantity: MedicationQuantityInputState
     @Published private(set) var isLoading = false
     @Published private(set) var errorMessage: String?
+    /// The dose that can still be reversed. Cleared automatically after `undoWindow`.
+    @Published private(set) var undoableDose: DoseRecord?
+
+    static let undoWindow: Duration = .seconds(5)
 
     private let medicationID: Medication.ID
     private let repository: MedicationDetailRepository
@@ -373,6 +419,8 @@ final class MedicationDetailViewModel: ObservableObject {
     private let refillQuantityConfiguration: MedicationQuantityInputConfiguration
     private let now: @Sendable () -> Date
     private var hasEditedRefillQuantity = false
+    private var undoTabletsRemaining: Int?
+    private var undoExpirationTask: Task<Void, Never>?
 
     var latestAllowedManualDoseDate: Date {
         now()
@@ -383,6 +431,7 @@ final class MedicationDetailViewModel: ObservableObject {
         repository: MedicationDetailRepository,
         snapshotBuilder: MedicationDetailSnapshotBuilding = MedicationDetailSnapshotBuilder(),
         refillQuantityConfiguration: MedicationQuantityInputConfiguration = .tabletCount,
+        initialSnapshot: MedicationDetailSnapshot? = nil,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.medicationID = medicationID
@@ -390,7 +439,10 @@ final class MedicationDetailViewModel: ObservableObject {
         self.snapshotBuilder = snapshotBuilder
         self.refillQuantityConfiguration = refillQuantityConfiguration
         self.now = now
-        self.refillQuantity = refillQuantityConfiguration.makeState(value: refillQuantityConfiguration.range.lowerBound)
+        self.snapshot = initialSnapshot
+        self.refillQuantity = refillQuantityConfiguration.makeState(
+            value: initialSnapshot?.medication.tabletsRemaining ?? refillQuantityConfiguration.range.lowerBound
+        )
     }
 
     convenience init(
@@ -398,10 +450,19 @@ final class MedicationDetailViewModel: ObservableObject {
         store: MedicationStore,
         snapshotBuilder: MedicationDetailSnapshotBuilding = MedicationDetailSnapshotBuilder()
     ) {
+        let repository = MedicationStoreDetailRepository(store: store)
+
         self.init(
             medicationID: medication.id,
-            repository: MedicationStoreDetailRepository(store: store),
-            snapshotBuilder: snapshotBuilder
+            repository: repository,
+            snapshotBuilder: snapshotBuilder,
+            // Paging builds a screen as it scrolls into view. Without a snapshot in
+            // hand it would enter showing the loading card and pop to its content a
+            // frame later — visible jank on every swipe onto a new medication.
+            initialSnapshot: snapshotBuilder.makeSnapshot(
+                medication: medication,
+                doseRecords: repository.currentDoseRecords(forMedicationID: medication.id)
+            )
         )
     }
 
@@ -437,14 +498,61 @@ final class MedicationDetailViewModel: ObservableObject {
             return
         }
 
+        var logResult: MedicationDoseLogResult?
+
         await performLoadingOperation {
             let currentMedication = try await repository.medication(id: medicationID)
-            _ = try await repository.logDose(
+            logResult = try await repository.logDose(
                 medicationID: medicationID,
                 dosageAmount: currentMedication.tabletsPerDose,
                 takenAt: takenAt
             )
             return try await loadSnapshot()
+        }
+
+        guard errorMessage == nil, let logResult else { return }
+        armUndo(for: logResult)
+    }
+
+    /// Reverses the dose still inside the undo window.
+    func undoLastDose() {
+        Task { await undoLastDose() }
+    }
+
+    func undoLastDose() async {
+        guard let undoableDose, let undoTabletsRemaining else { return }
+
+        cancelUndo()
+
+        await performLoadingOperation {
+            _ = try await repository.undoDose(
+                medicationID: medicationID,
+                recordID: undoableDose.id,
+                restoringTabletsTo: undoTabletsRemaining
+            )
+            return try await loadSnapshot()
+        }
+    }
+
+    /// Call when the detail view disappears so a stale bar cannot outlive the screen.
+    func cancelUndo() {
+        undoExpirationTask?.cancel()
+        undoExpirationTask = nil
+        undoableDose = nil
+        undoTabletsRemaining = nil
+    }
+
+    private func armUndo(for logResult: MedicationDoseLogResult) {
+        undoExpirationTask?.cancel()
+        undoableDose = logResult.record
+        undoTabletsRemaining = logResult.previousTabletsRemaining
+
+        let recordID = logResult.record.id
+        undoExpirationTask = Task { [weak self] in
+            try? await Task.sleep(for: Self.undoWindow)
+            guard !Task.isCancelled else { return }
+            guard let self, undoableDose?.id == recordID else { return }
+            cancelUndo()
         }
     }
 
@@ -541,6 +649,99 @@ final class MedicationDetailViewModel: ObservableObject {
     }
 }
 
+/// Scores logged doses against what the active reminders expected, per day.
+/// Shared by the calendar's day markers and the streak in the day summary.
+struct MedicationAdherenceCalculator {
+    var calendar: Calendar
+    var now: @Sendable () -> Date
+
+    init(calendar: Calendar = .current, now: @escaping @Sendable () -> Date = { Date() }) {
+        self.calendar = calendar
+        self.now = now
+    }
+
+    /// Scheduled occurrences — a reminder for 2 tablets is still one dose.
+    func expectedDoseCount(for medications: [Medication], on date: Date) -> Int {
+        guard let weekday = Medication.Weekday(rawValue: calendar.component(.weekday, from: date)) else {
+            return 0
+        }
+
+        return medications.reduce(0) { total, medication in
+            total + medication.reminders.filter { reminder in
+                guard reminder.isActive else { return false }
+
+                switch reminder.frequency {
+                case .daily:
+                    return true
+                case .specificDays:
+                    return reminder.weekdays.isEmpty || reminder.weekdays.contains(weekday)
+                case .asNeeded:
+                    return false
+                }
+            }.count
+        }
+    }
+
+    func dayStatus(expectedDoses: Int, loggedDoses: Int, on date: Date) -> MedicationDayStatus {
+        let adherence: MedicationDayAdherence
+
+        if expectedDoses == 0 {
+            adherence = .none
+        } else if loggedDoses >= expectedDoses {
+            adherence = .complete
+        } else if loggedDoses > 0 {
+            adherence = .partial
+        } else if calendar.startOfDay(for: date) < calendar.startOfDay(for: now()) {
+            adherence = .missed
+        } else {
+            // Today is still in progress — not missed yet.
+            adherence = .none
+        }
+
+        return MedicationDayStatus(
+            expectedDoses: expectedDoses,
+            loggedDoses: loggedDoses,
+            adherence: adherence
+        )
+    }
+
+    /// Consecutive complete days ending today. Days that expected nothing are skipped
+    /// rather than counted or treated as breaks, and today still in progress does not
+    /// end a streak earned yesterday.
+    func currentStreak(
+        medications: [Medication],
+        loggedDosesByDay: [Date: Int],
+        maximumLookbackDays: Int = 400
+    ) -> Int {
+        var streak = 0
+        var day = calendar.startOfDay(for: now())
+
+        for offset in 0..<maximumLookbackDays {
+            let expected = expectedDoseCount(for: medications, on: day)
+            let logged = loggedDosesByDay[day] ?? 0
+
+            if expected == 0 {
+                guard let previous = calendar.date(byAdding: .day, value: -1, to: day) else { break }
+                day = previous
+                continue
+            }
+
+            if logged >= expected {
+                streak += 1
+            } else if offset == 0 {
+                // Today has not finished; fall through to yesterday.
+            } else {
+                break
+            }
+
+            guard let previous = calendar.date(byAdding: .day, value: -1, to: day) else { break }
+            day = previous
+        }
+
+        return streak
+    }
+}
+
 protocol MedicationDetailSnapshotBuilding: Sendable {
     func makeSnapshot(medication: Medication, doseRecords: [DoseRecord]) -> MedicationDetailSnapshot
 }
@@ -557,6 +758,12 @@ struct MedicationDetailSnapshotBuilder: MedicationDetailSnapshotBuilding {
     func makeSnapshot(medication: Medication, doseRecords: [DoseRecord]) -> MedicationDetailSnapshot {
         let sortedDoseRecords = doseRecords.sorted { $0.takenAt > $1.takenAt }
         let stockStatus = makeStockStatus(for: medication)
+        let reminderOverview = makeReminderOverview(for: medication)
+        let todayStatus = makeTodayStatus(
+            for: medication,
+            doseRecords: sortedDoseRecords,
+            reminderOverview: reminderOverview
+        )
 
         return MedicationDetailSnapshot(
             medication: medication,
@@ -564,49 +771,261 @@ struct MedicationDetailSnapshotBuilder: MedicationDetailSnapshotBuilding {
                 id: medication.id,
                 name: medication.name,
                 classificationText: medication.classification.title,
-                shapeText: medication.medicationShape.title,
                 bottleColorHex: medication.bottleColorHex
             ),
+            todayStatus: todayStatus,
             stockStatus: stockStatus,
             metrics: makeMetrics(for: medication, doseRecords: sortedDoseRecords, stockStatus: stockStatus),
-            reminderOverview: makeReminderOverview(for: medication),
-            actions: makeActions(for: medication),
+            reminderOverview: reminderOverview,
+            actions: makeActions(for: medication, todayStatus: todayStatus),
             recentDoseRecords: Array(sortedDoseRecords.prefix(5))
         )
     }
 
-    private func makeStockStatus(for medication: Medication) -> MedicationStockStatus {
+    /// Doses expected per day from active, scheduled reminders. 0 when as-needed/none.
+    func dosesPerDay(for medication: Medication) -> Double {
+        medication.reminders.reduce(into: 0.0) { total, reminder in
+            guard reminder.isActive else { return }
+
+            switch reminder.frequency {
+            case .daily:
+                total += 1
+            case .specificDays:
+                total += Double(reminder.weekdays.count) / 7.0
+            case .asNeeded:
+                break
+            }
+        }
+    }
+
+    /// Also used by Manage Medications, which shows the supply headline per row.
+    func makeStockStatus(for medication: Medication) -> MedicationStockStatus {
         let remaining = max(0, medication.tabletsRemaining)
         let dose = max(1, medication.tabletsPerDose)
         let fullDoses = remaining / dose
+        let tabletsPerDay = Double(dose) * dosesPerDay(for: medication)
+
+        let daysRemaining: Int? = tabletsPerDay > 0
+            ? Int((Double(remaining) / tabletsPerDay).rounded(.down))
+            : nil
+        let runsOut = daysRemaining.flatMap {
+            calendar.date(byAdding: .day, value: $0, to: calendar.startOfDay(for: now()))
+        }
+
+        let supplyHeadline: String
+        if let daysRemaining {
+            supplyHeadline = "\(daysRemaining) \(dayText(daysRemaining)) left"
+        } else {
+            supplyHeadline = "\(remaining) \(tabletText(remaining)) left"
+        }
+
+        let supplyDetail = runsOut.map { "Runs out \(monthDayText($0))" } ?? "No schedule set"
+
+        // Ordering on the day it empties is already too late; back off the same lead time
+        // that decides when the bottle counts as low. Once that day has passed the card
+        // is showing urgency instead, so there is nothing to plan.
+        let reorderBy = runsOut
+            .flatMap { calendar.date(byAdding: .day, value: -MedicationStockStatus.refillLeadDays, to: $0) }
+            .flatMap { $0 > now() ? $0 : nil }
+
+        func status(level: MedicationStockLevel, title: String, message: String) -> MedicationStockStatus {
+            MedicationStockStatus(
+                level: level,
+                title: title,
+                message: message,
+                remainingCount: remaining,
+                remainingDoses: fullDoses,
+                daysRemaining: daysRemaining,
+                runsOutDate: runsOut,
+                supplyHeadline: supplyHeadline,
+                supplyDetail: supplyDetail,
+                reorderByDate: reorderBy
+            )
+        }
 
         if remaining == 0 {
-            return MedicationStockStatus(
+            return status(
                 level: .empty,
                 title: "Empty",
-                message: "Refill this bottle before the next dose.",
-                remainingCount: 0,
-                remainingDoses: 0
+                message: "Refill this bottle before the next dose."
+            )
+        }
+
+        if let daysRemaining {
+            if daysRemaining <= MedicationStockStatus.refillLeadDays {
+                return status(
+                    level: .low,
+                    title: "Refill soon",
+                    message: "Only \(daysRemaining) \(dayText(daysRemaining)) left — order a refill now."
+                )
+            }
+
+            return status(
+                level: .ready,
+                title: "On hand",
+                message: runsOut.map { "Enough until \(monthDayText($0))." } ?? "No schedule set."
             )
         }
 
         if fullDoses <= 3 {
-            return MedicationStockStatus(
+            return status(
                 level: .low,
-                title: "Low stock",
-                message: fullDoses == 0 ? "Less than one full dose remains." : "\(fullDoses) full dose\(fullDoses == 1 ? "" : "s") left.",
-                remainingCount: remaining,
-                remainingDoses: fullDoses
+                title: "Refill soon",
+                message: fullDoses == 0
+                    ? "Less than one full dose remains — order a refill now."
+                    : "Only \(fullDoses) full \(fullDoses == 1 ? "dose" : "doses") left — order a refill now."
             )
         }
 
-        return MedicationStockStatus(
+        return status(
             level: .ready,
             title: "On hand",
-            message: "\(fullDoses) full doses available.",
-            remainingCount: remaining,
-            remainingDoses: fullDoses
+            message: "No schedule set."
         )
+    }
+
+    private func makeTodayStatus(
+        for medication: Medication,
+        doseRecords: [DoseRecord],
+        reminderOverview: MedicationReminderOverview
+    ) -> MedicationTodayStatus {
+        var status = makeTodayVerdict(
+            for: medication,
+            doseRecords: doseRecords,
+            reminderOverview: reminderOverview
+        )
+
+        status.scheduleDetail = makeScheduleDetail(
+            for: medication,
+            overview: reminderOverview,
+            verdict: status.verdict
+        )
+
+        return status
+    }
+
+    /// "Next tomorrow 8:30 AM · 1 tablet" — or the cadence alone when the title already
+    /// names the time, and whatever the reminder overview says when nothing is scheduled.
+    private func makeScheduleDetail(
+        for medication: Medication,
+        overview: MedicationReminderOverview,
+        verdict: MedicationDoseVerdict
+    ) -> String {
+        guard
+            let nextReminderDate = overview.nextReminderDate,
+            verdict != .upcoming,
+            let lead = leadReminder(for: medication, nextReminder: nextReminderDate)
+        else {
+            return overview.subtitle
+        }
+
+        let doseAmount = max(1, lead.dosageAmount)
+        return "Next \(relativeDateTimeText(nextReminderDate)) · \(doseAmount) tablet\(doseAmount == 1 ? "" : "s")"
+    }
+
+    private func makeTodayVerdict(
+        for medication: Medication,
+        doseRecords: [DoseRecord],
+        reminderOverview: MedicationReminderOverview
+    ) -> MedicationTodayStatus {
+        let today = doseRecords
+            .filter { isToday($0.takenAt) }
+            .sorted { $0.takenAt < $1.takenAt }
+
+        let scheduledReminders = medication.reminders.filter { $0.isActive && $0.frequency != .asNeeded }
+
+        if !today.isEmpty {
+            return MedicationTodayStatus(
+                verdict: .takenToday,
+                title: "Taken today",
+                detail: takenTodayDetail(today),
+                systemImage: "checkmark.circle.fill"
+            )
+        }
+
+        guard !scheduledReminders.isEmpty else {
+            return MedicationTodayStatus(
+                verdict: .noSchedule,
+                title: "As needed",
+                detail: lastTakenDetail(for: medication.lastTakenAt),
+                systemImage: "pills"
+            )
+        }
+
+        let occurrencesToday = scheduledReminders
+            .compactMap { $0.detailOccurrenceToday(now: now(), calendar: calendar) }
+            .sorted()
+
+        if let latestPassed = occurrencesToday.last(where: { $0 <= now() }) {
+            return MedicationTodayStatus(
+                verdict: .dueNow,
+                title: "Due now",
+                detail: "\(timeText(latestPassed)) dose not logged",
+                systemImage: "exclamationmark.circle.fill"
+            )
+        }
+
+        if let nextToday = occurrencesToday.first(where: { $0 > now() }) {
+            return MedicationTodayStatus(
+                verdict: .upcoming,
+                title: "Due at \(timeText(nextToday))",
+                detail: "Nothing logged yet today",
+                systemImage: "clock"
+            )
+        }
+
+        // Scheduled, but not on this weekday.
+        if let nextReminderDate = reminderOverview.nextReminderDate {
+            return MedicationTodayStatus(
+                verdict: .upcoming,
+                title: "Due \(relativeDateTimeText(nextReminderDate))",
+                detail: "Nothing logged yet today",
+                systemImage: "clock"
+            )
+        }
+
+        return MedicationTodayStatus(
+            verdict: .noSchedule,
+            title: "As needed",
+            detail: lastTakenDetail(for: medication.lastTakenAt),
+            systemImage: "pills"
+        )
+    }
+
+    /// Beyond a handful of doses the individual times stop being information and start
+    /// being a wall of text that pushes the rest of the screen down, so the card keeps
+    /// the count and the most recent time instead of every timestamp.
+    private static let takenTodayTimeLimit = 3
+
+    private func takenTodayDetail(_ today: [DoseRecord]) -> String {
+        let times = today.map { timeText($0.takenAt) }
+
+        if today.count > Self.takenTodayTimeLimit {
+            let latest = times.last ?? ""
+            return "\(today.count) doses · latest \(latest)"
+        }
+
+        if today.count > 1 {
+            return "\(today.count) doses · \(times.joined(separator: ", "))"
+        }
+
+        // The next dose lives on the status line now, so this stays purely a record of
+        // what happened today.
+        return times.first ?? "Logged today"
+    }
+
+    private func lastTakenDetail(for date: Date?) -> String {
+        guard let date else { return "No doses logged yet" }
+
+        if isToday(date) {
+            return "Last taken today, \(timeText(date))"
+        }
+
+        if isYesterday(date) {
+            return "Last taken yesterday, \(timeText(date))"
+        }
+
+        return "Last taken \(date.formatted(date: .abbreviated, time: .shortened))"
     }
 
     private func makeMetrics(
@@ -654,9 +1073,10 @@ struct MedicationDetailSnapshotBuilder: MedicationDetailSnapshotBuilding {
 
         return MedicationReminderOverview(
             title: reminderTitle(activeCount: activeSummaries.count, totalCount: summaries.count),
-            subtitle: reminderSubtitle(activeCount: activeSummaries.count, totalCount: summaries.count),
+            subtitle: reminderSubtitle(for: medication, nextReminder: nextReminder),
             activeCount: activeSummaries.count,
             nextReminderText: nextReminder.map { "Next: \(shortDateTime($0))" },
+            nextReminderDate: nextReminder,
             reminders: summaries
         )
     }
@@ -675,18 +1095,37 @@ struct MedicationDetailSnapshotBuilder: MedicationDetailSnapshotBuilding {
         )
     }
 
-    private func makeActions(for medication: Medication) -> MedicationDetailActions {
+    private func makeActions(
+        for medication: Medication,
+        todayStatus: MedicationTodayStatus
+    ) -> MedicationDetailActions {
         let canLogDose = medication.tabletsRemaining > 0
+        let isDoseLoggedToday = todayStatus.verdict == .takenToday
         let defaultRefillCount = max(30, medication.tabletsRemaining + max(1, medication.tabletsPerDose) * 30)
+
+        let primaryTitle: String
+        let primarySystemImage: String
+        switch (canLogDose, isDoseLoggedToday) {
+        case (false, _):
+            primaryTitle = "Refill bottle"
+            primarySystemImage = "arrow.triangle.2.circlepath"
+        case (true, true):
+            primaryTitle = "Log another dose"
+            primarySystemImage = "plus"
+        case (true, false):
+            primaryTitle = "Log dose"
+            primarySystemImage = "checkmark"
+        }
 
         return MedicationDetailActions(
             canLogDose: canLogDose,
             canRefill: true,
-            primaryTitle: canLogDose ? "Log dose" : "Refill bottle",
-            primarySystemImage: canLogDose ? "checkmark" : "arrow.triangle.2.circlepath",
+            primaryTitle: primaryTitle,
+            primarySystemImage: primarySystemImage,
             refillTitle: "Refill",
             refillSystemImage: "plus.circle",
-            defaultRefillCount: defaultRefillCount
+            defaultRefillCount: defaultRefillCount,
+            isDoseLoggedToday: isDoseLoggedToday
         )
     }
 
@@ -710,11 +1149,11 @@ struct MedicationDetailSnapshotBuilder: MedicationDetailSnapshotBuilding {
     private func lastTakenText(for date: Date?) -> String {
         guard let date else { return "Not yet" }
 
-        if calendar.isDateInToday(date) {
+        if isToday(date) {
             return "Today, \(date.formatted(date: .omitted, time: .shortened))"
         }
 
-        if calendar.isDateInYesterday(date) {
+        if isYesterday(date) {
             return "Yesterday, \(date.formatted(date: .omitted, time: .shortened))"
         }
 
@@ -722,15 +1161,56 @@ struct MedicationDetailSnapshotBuilder: MedicationDetailSnapshotBuilding {
     }
 
     private func shortDateTime(_ date: Date) -> String {
-        if calendar.isDateInToday(date) {
+        if isToday(date) {
             return "Today at \(date.formatted(date: .omitted, time: .shortened))"
         }
 
-        if calendar.isDateInTomorrow(date) {
+        if isTomorrow(date) {
             return "Tomorrow at \(date.formatted(date: .omitted, time: .shortened))"
         }
 
         return date.formatted(.dateTime.weekday(.abbreviated).hour().minute())
+    }
+
+    // `Calendar.isDateInToday` and friends read the system clock, which ignores the
+    // injected `now`. These relative checks stay honest under a fixed clock.
+    private func isToday(_ date: Date) -> Bool {
+        calendar.isDate(date, inSameDayAs: now())
+    }
+
+    private func isYesterday(_ date: Date) -> Bool {
+        guard let yesterday = calendar.date(byAdding: .day, value: -1, to: now()) else { return false }
+        return calendar.isDate(date, inSameDayAs: yesterday)
+    }
+
+    private func isTomorrow(_ date: Date) -> Bool {
+        guard let tomorrow = calendar.date(byAdding: .day, value: 1, to: now()) else { return false }
+        return calendar.isDate(date, inSameDayAs: tomorrow)
+    }
+
+    private func timeText(_ date: Date) -> String {
+        date.formatted(date: .omitted, time: .shortened)
+    }
+
+    private func monthDayText(_ date: Date) -> String {
+        date.formatted(.dateTime.month().day())
+    }
+
+    /// "today 8:30 PM" | "tomorrow 8:30 AM" | "Thu 8:30 AM" — reads inline after "next" or "Due".
+    private func relativeDateTimeText(_ date: Date) -> String {
+        if isToday(date) {
+            return "today \(timeText(date))"
+        }
+
+        if isTomorrow(date) {
+            return "tomorrow \(timeText(date))"
+        }
+
+        return date.formatted(.dateTime.weekday(.abbreviated).hour().minute())
+    }
+
+    private func dayText(_ count: Int) -> String {
+        count == 1 ? "day" : "days"
     }
 
     private func reminderTitle(activeCount: Int, totalCount: Int) -> String {
@@ -739,10 +1219,43 @@ struct MedicationDetailSnapshotBuilder: MedicationDetailSnapshotBuilding {
         return activeCount == 1 ? "1 active reminder" : "\(activeCount) active reminders"
     }
 
-    private func reminderSubtitle(activeCount: Int, totalCount: Int) -> String {
-        if totalCount == 0 { return "No schedule has been set." }
-        if activeCount == 0 { return "All reminders are currently paused." }
-        return "Medication reminders are ready."
+    /// `Everyday · 1 tablet` / `Mon, Wed, Fri · 2 tablets` / `As needed` / `All reminders paused` / `No schedule set`
+    private func reminderSubtitle(for medication: Medication, nextReminder: Date?) -> String {
+        guard !medication.reminders.isEmpty else { return "No schedule set" }
+
+        let activeReminders = medication.reminders.filter(\.isActive)
+        guard !activeReminders.isEmpty else { return "All reminders paused" }
+
+        guard let leadReminder = leadReminder(for: medication, nextReminder: nextReminder) else {
+            return "As needed"
+        }
+
+        let doseAmount = max(1, leadReminder.dosageAmount)
+        let doseText = "\(doseAmount) tablet\(doseAmount == 1 ? "" : "s")"
+
+        switch leadReminder.frequency {
+        case .daily:
+            return "Everyday · \(doseText)"
+        case .specificDays:
+            let days = leadReminder.weekdays
+                .sorted { $0.rawValue < $1.rawValue }
+                .map(\.shortTitle)
+                .joined(separator: ", ")
+            return "\(days.isEmpty ? "Custom days" : days) · \(doseText)"
+        case .asNeeded:
+            return "As needed"
+        }
+    }
+
+    /// The scheduled reminder the next dose comes from — the one that fires next, or the
+    /// earliest of the day when nothing is pending. `nil` when nothing is scheduled.
+    private func leadReminder(for medication: Medication, nextReminder: Date?) -> Medication.Reminder? {
+        let scheduled = medication.reminders.filter { $0.isActive && $0.frequency != .asNeeded }
+        guard !scheduled.isEmpty else { return nil }
+
+        return scheduled.first {
+            $0.detailNextOccurrence(from: now(), calendar: calendar) == nextReminder
+        } ?? scheduled.sorted { $0.time < $1.time }[0]
     }
 
     private func tabletText(_ count: Int) -> String {
@@ -751,6 +1264,25 @@ struct MedicationDetailSnapshotBuilder: MedicationDetailSnapshotBuilding {
 }
 
 private extension Medication.Reminder {
+    /// This reminder's time mapped onto today, past or future. `nil` when it does not fire today.
+    func detailOccurrenceToday(now: Date, calendar: Calendar) -> Date? {
+        guard isActive, frequency != .asNeeded else { return nil }
+
+        let components = calendar.dateComponents([.hour, .minute], from: time)
+        guard let hour = components.hour, let minute = components.minute else { return nil }
+
+        let validWeekdays: Set<Medication.Weekday> = frequency == .daily
+            ? Set(Medication.Weekday.allCases)
+            : (weekdays.isEmpty ? Set(Medication.Weekday.allCases) : weekdays)
+
+        guard let today = Medication.Weekday(rawValue: calendar.component(.weekday, from: now)),
+              validWeekdays.contains(today) else {
+            return nil
+        }
+
+        return calendar.date(bySettingHour: hour, minute: minute, second: 0, of: now)
+    }
+
     func detailNextOccurrence(from now: Date = Date(), calendar: Calendar = .current) -> Date? {
         guard isActive, frequency != .asNeeded else { return nil }
 

@@ -45,6 +45,13 @@ enum AppTheme {
         light: UIColor(red: 0.10, green: 0.42, blue: 0.38, alpha: 0.18),
         dark: UIColor(red: 0.55, green: 0.88, blue: 0.80, alpha: 0.20)
     )
+
+    /// Low supply and overdue doses.
+    static let warning = Color(red: 0.72, green: 0.46, blue: 0.10)
+    /// Empty bottle.
+    static let critical = Color(red: 0.72, green: 0.16, blue: 0.16)
+
+    static let bottleColors = ["D99A00", "C87B00", "8FB7D8", "74A88D", "D35F7B"]
 }
 
 extension Color {
@@ -93,11 +100,13 @@ extension UIColor {
 
         getRed(&red, green: &green, blue: &blue, alpha: &alpha)
 
-        return String(
-            format: "%02X%02X%02X",
-            Int(red * 255),
-            Int(green * 255),
-            Int(blue * 255)
-        )
+        // The system colour picker hands back wide-gamut colours, whose sRGB components
+        // can land outside 0...1. Unclamped they overflow the byte and the bottle comes
+        // back a different colour than the one that was picked.
+        func channel(_ value: CGFloat) -> Int {
+            Int((min(max(value, 0), 1) * 255).rounded())
+        }
+
+        return String(format: "%02X%02X%02X", channel(red), channel(green), channel(blue))
     }
 }

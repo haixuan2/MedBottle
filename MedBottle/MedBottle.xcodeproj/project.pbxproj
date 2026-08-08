@@ -12,6 +12,7 @@
 		8B3F3A332C20100100100001 /* AppState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B3F3A222C20100100100001 /* AppState.swift */; };
 		8B3F3A342C20100100100001 /* Color+Hex.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B3F3A232C20100100100001 /* Color+Hex.swift */; };
 		8B3F3A352C20100100100001 /* BottleSceneView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B3F3A242C20100100100001 /* BottleSceneView.swift */; };
+		8B3F3A702C20100100100001 /* MedicationBottleGauge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B3F3A712C20100100100001 /* MedicationBottleGauge.swift */; };
 		8B3F3A362C20100100100001 /* AddMedicationView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B3F3A252C20100100100001 /* AddMedicationView.swift */; };
 		8B3F3A372C20100100100001 /* DoseHistoryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B3F3A272C20100100100001 /* DoseHistoryView.swift */; };
 		8B3F3A382C20100100100001 /* MedicationSearchManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B3F3A392C20100100100001 /* MedicationSearchManager.swift */; };
@@ -21,6 +22,7 @@
 		8B3F3A412C20100100100001 /* MedicationDetailViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B3F3A402C20100100100001 /* MedicationDetailViewModel.swift */; };
 		8B3F3A502C20100100100001 /* MedicationDetailViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B3F3A532C20100100100001 /* MedicationDetailViewModelTests.swift */; };
 		8B3F3A652C20100100100001 /* BottleScenePhysicsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B3F3A662C20100100100001 /* BottleScenePhysicsTests.swift */; };
+		8B3F3A742C20100100100001 /* MedicationBottleGaugeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B3F3A752C20100100100001 /* MedicationBottleGaugeTests.swift */; };
 		8B3F3A612C20100100100001 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 8B3F3A602C20100100100001 /* Assets.xcassets */; };
 		8B3F3A642C20100100100001 /* studio_lighting.hdr in Resources */ = {isa = PBXBuildFile; fileRef = 8B3F3A632C20100100100001 /* studio_lighting.hdr */; };
 /* End PBXBuildFile section */
@@ -42,6 +44,7 @@
 		8B3F3A222C20100100100001 /* AppState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppState.swift; sourceTree = "<group>"; };
 		8B3F3A232C20100100100001 /* Color+Hex.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Color+Hex.swift"; sourceTree = "<group>"; };
 		8B3F3A242C20100100100001 /* BottleSceneView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BottleSceneView.swift; sourceTree = "<group>"; };
+		8B3F3A712C20100100100001 /* MedicationBottleGauge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MedicationBottleGauge.swift; sourceTree = "<group>"; };
 		8B3F3A252C20100100100001 /* AddMedicationView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AddMedicationView.swift; sourceTree = "<group>"; };
 		8B3F3A262C20100100100001 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		8B3F3A272C20100100100001 /* DoseHistoryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DoseHistoryView.swift; sourceTree = "<group>"; };
@@ -53,6 +56,7 @@
 		8B3F3A522C20100100100001 /* MedBottleTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = MedBottleTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		8B3F3A532C20100100100001 /* MedicationDetailViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MedicationDetailViewModelTests.swift; sourceTree = "<group>"; };
 		8B3F3A662C20100100100001 /* BottleScenePhysicsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BottleScenePhysicsTests.swift; sourceTree = "<group>"; };
+		8B3F3A752C20100100100001 /* MedicationBottleGaugeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MedicationBottleGaugeTests.swift; sourceTree = "<group>"; };
 		8B3F3A602C20100100100001 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		8B3F3A632C20100100100001 /* studio_lighting.hdr */ = {isa = PBXFileReference; lastKnownFileType = file; path = studio_lighting.hdr; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -101,6 +105,7 @@
 				8B3F3A222C20100100100001 /* AppState.swift */,
 				8B3F3A232C20100100100001 /* Color+Hex.swift */,
 				8B3F3A242C20100100100001 /* BottleSceneView.swift */,
+				8B3F3A712C20100100100001 /* MedicationBottleGauge.swift */,
 				8B3F3A252C20100100100001 /* AddMedicationView.swift */,
 				8B3F3A3A2C20100100100001 /* ManageMedicationsView.swift */,
 				8B3F3A392C20100100100001 /* MedicationSearchManager.swift */,
@@ -127,6 +132,7 @@
 			isa = PBXGroup;
 			children = (
 				8B3F3A662C20100100100001 /* BottleScenePhysicsTests.swift */,
+				8B3F3A752C20100100100001 /* MedicationBottleGaugeTests.swift */,
 				8B3F3A532C20100100100001 /* MedicationDetailViewModelTests.swift */,
 			);
 			path = MedBottleTests;
@@ -237,6 +243,7 @@
 				8B3F3A332C20100100100001 /* AppState.swift in Sources */,
 				8B3F3A342C20100100100001 /* Color+Hex.swift in Sources */,
 				8B3F3A352C20100100100001 /* BottleSceneView.swift in Sources */,
+				8B3F3A702C20100100100001 /* MedicationBottleGauge.swift in Sources */,
 				8B3F3A362C20100100100001 /* AddMedicationView.swift in Sources */,
 				8B3F3A3B2C20100100100001 /* ManageMedicationsView.swift in Sources */,
 				8B3F3A372C20100100100001 /* DoseHistoryView.swift in Sources */,
@@ -252,6 +259,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				8B3F3A652C20100100100001 /* BottleScenePhysicsTests.swift in Sources */,
+				8B3F3A742C20100100100001 /* MedicationBottleGaugeTests.swift in Sources */,
 				8B3F3A502C20100100100001 /* MedicationDetailViewModelTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

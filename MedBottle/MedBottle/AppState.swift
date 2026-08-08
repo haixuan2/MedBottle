@@ -1,23 +1,5 @@
 import Foundation
 
-enum MedicationShape: String, Codable, CaseIterable, Identifiable, Sendable {
-    case tablet
-    case pill
-    case capsule
-    case softgel
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .tablet: "Tablet"
-        case .pill: "Pill"
-        case .capsule: "Capsule"
-        case .softgel: "Softgel"
-        }
-    }
-}
-
 enum MedicationClassification: String, Codable, CaseIterable, Identifiable, Sendable {
     case prescription
     case otc
@@ -103,13 +85,23 @@ struct Medication: Identifiable, Codable, Equatable, Sendable {
     var tabletsRemaining: Int
     var tabletsPerDose: Int
     var bottleColorHex: String
-    var medicationShape: MedicationShape
     var classification: MedicationClassification
     var reminders: [Reminder]
     var lastTakenAt: Date?
+    /// Highest tablet count this bottle has held. The bottle visual reads as a gauge
+    /// against this, so a 30-tablet bottle at 15 looks half full.
+    var bottleCapacity: Int
+    /// RxNorm concept id from search. Nothing reads it yet — drug interactions need it.
+    var rxcui: String?
 
     var remainingText: String {
         "\(tabletsRemaining) tablet\(tabletsRemaining == 1 ? "" : "s")"
+    }
+
+    /// 0...1 share of the bottle still filled.
+    var fillRatio: Double {
+        let capacity = max(1, bottleCapacity)
+        return min(1, max(0, Double(tabletsRemaining) / Double(capacity)))
     }
 
     enum CodingKeys: String, CodingKey {
@@ -118,10 +110,11 @@ struct Medication: Identifiable, Codable, Equatable, Sendable {
         case tabletsRemaining
         case tabletsPerDose
         case bottleColorHex
-        case medicationShape
         case classification
         case reminders
         case lastTakenAt
+        case bottleCapacity
+        case rxcui
     }
 
     init(
@@ -130,20 +123,22 @@ struct Medication: Identifiable, Codable, Equatable, Sendable {
         tabletsRemaining: Int,
         tabletsPerDose: Int,
         bottleColorHex: String,
-        medicationShape: MedicationShape,
         classification: MedicationClassification = .prescription,
         reminders: [Reminder] = [],
-        lastTakenAt: Date?
+        lastTakenAt: Date?,
+        bottleCapacity: Int? = nil,
+        rxcui: String? = nil
     ) {
         self.id = id
         self.name = name
         self.tabletsRemaining = tabletsRemaining
         self.tabletsPerDose = tabletsPerDose
         self.bottleColorHex = bottleColorHex
-        self.medicationShape = medicationShape
         self.classification = classification
         self.reminders = reminders
         self.lastTakenAt = lastTakenAt
+        self.bottleCapacity = max(1, bottleCapacity ?? tabletsRemaining)
+        self.rxcui = rxcui
     }
 
     init(from decoder: Decoder) throws {
@@ -153,10 +148,12 @@ struct Medication: Identifiable, Codable, Equatable, Sendable {
         tabletsRemaining = try container.decode(Int.self, forKey: .tabletsRemaining)
         tabletsPerDose = try container.decode(Int.self, forKey: .tabletsPerDose)
         bottleColorHex = try container.decode(String.self, forKey: .bottleColorHex)
-        medicationShape = try container.decodeIfPresent(MedicationShape.self, forKey: .medicationShape) ?? .tablet
         classification = try container.decodeIfPresent(MedicationClassification.self, forKey: .classification) ?? .prescription
         reminders = try container.decodeIfPresent([Reminder].self, forKey: .reminders) ?? []
         lastTakenAt = try container.decodeIfPresent(Date.self, forKey: .lastTakenAt)
+        // Bottles saved before capacity existed adopt their current count as capacity.
+        bottleCapacity = max(1, try container.decodeIfPresent(Int.self, forKey: .bottleCapacity) ?? tabletsRemaining)
+        rxcui = try container.decodeIfPresent(String.self, forKey: .rxcui)
     }
 }
 
@@ -199,7 +196,6 @@ final class MedicationStore: ObservableObject {
                     tabletsRemaining: 30,
                     tabletsPerDose: 1,
                     bottleColorHex: "D99A00",
-                    medicationShape: .tablet,
                     lastTakenAt: nil
                 )
             ]
@@ -217,8 +213,9 @@ final class MedicationStore: ObservableObject {
         logDose(forMedicationID: medication.id, dosageAmount: medication.tabletsPerDose)
     }
 
-    func logDose(forMedicationID medicationID: Medication.ID, dosageAmount: Int, takenAt: Date = Date()) {
-        guard let index = medications.firstIndex(where: { $0.id == medicationID }) else { return }
+    @discardableResult
+    func logDose(forMedicationID medicationID: Medication.ID, dosageAmount: Int, takenAt: Date = Date()) -> DoseRecord? {
+        guard let index = medications.firstIndex(where: { $0.id == medicationID }) else { return nil }
         let dose = max(1, dosageAmount)
         medications[index].tabletsRemaining = max(0, medications[index].tabletsRemaining - dose)
         medications[index].lastTakenAt = latestDoseDate(
@@ -234,33 +231,58 @@ final class MedicationStore: ObservableObject {
             tabletCount: dose
         )
         doseRecords = (doseRecords + [record]).sorted { $0.takenAt > $1.takenAt }
+        return record
     }
 
+    /// Reverses a single logged dose: removes the record, restores the exact pre-log bottle
+    /// count, and recomputes `lastTakenAt` from the records that survive.
+    func undoDose(
+        medicationID: Medication.ID,
+        recordID: DoseRecord.ID,
+        restoringTabletsTo count: Int
+    ) {
+        guard let index = medications.firstIndex(where: { $0.id == medicationID }),
+              doseRecords.contains(where: { $0.id == recordID }) else {
+            return
+        }
+
+        doseRecords.removeAll { $0.id == recordID }
+        medications[index].tabletsRemaining = MedicationQuantityLimits.tabletCount.clamping(count)
+        medications[index].lastTakenAt = latestDoseDate(
+            forMedicationID: medicationID,
+            excluding: []
+        )
+    }
+
+    @discardableResult
     func addMedication(
         name: String,
         tablets: Int,
         dose: Int,
         colorHex: String,
-        shape: MedicationShape,
         classification: MedicationClassification,
-        reminders: [Medication.Reminder] = []
-    ) {
+        reminders: [Medication.Reminder] = [],
+        rxcui: String? = nil
+    ) -> Medication? {
         let cleanedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanedName.isEmpty else { return }
+        guard !cleanedName.isEmpty else { return nil }
 
+        let clampedTablets = MedicationQuantityLimits.tabletCount.clamping(tablets)
         let medication = Medication(
             id: UUID(),
             name: cleanedName,
-            tabletsRemaining: MedicationQuantityLimits.tabletCount.clamping(tablets),
+            tabletsRemaining: clampedTablets,
             tabletsPerDose: MedicationQuantityLimits.doseCount.clamping(dose),
             bottleColorHex: colorHex,
-            medicationShape: shape,
             classification: classification,
             reminders: sanitizedReminders(reminders),
-            lastTakenAt: nil
+            lastTakenAt: nil,
+            bottleCapacity: clampedTablets,
+            rxcui: rxcui
         )
         medications.append(medication)
         NotificationManager.shared.scheduleReminders(for: medication)
+        return medication
     }
 
     func updateMedication(_ medication: Medication) {
@@ -271,6 +293,7 @@ final class MedicationStore: ObservableObject {
         updatedMedication.tabletsRemaining = MedicationQuantityLimits.tabletCount.clamping(medication.tabletsRemaining)
         updatedMedication.tabletsPerDose = MedicationQuantityLimits.doseCount.clamping(medication.tabletsPerDose)
         updatedMedication.reminders = sanitizedReminders(medication.reminders)
+        updatedMedication.bottleCapacity = max(medication.bottleCapacity, updatedMedication.tabletsRemaining)
         medications[index] = updatedMedication
 
         if previousMedication.reminderScheduleSignature != updatedMedication.reminderScheduleSignature {
@@ -302,7 +325,10 @@ final class MedicationStore: ObservableObject {
         return replacementSelection
     }
 
-    func deleteDoseRecords(withIDs recordIDs: Set<DoseRecord.ID>) {
+    /// - Parameter returningTablets: when `true` the deleted doses are added back to the
+    ///   bottle. The user chooses this explicitly in the delete confirmation, because a
+    ///   mistyped record and a dose that was never taken need opposite outcomes.
+    func deleteDoseRecords(withIDs recordIDs: Set<DoseRecord.ID>, returningTablets: Bool = true) {
         let deletedRecords = doseRecords.filter { recordIDs.contains($0.id) }
         guard !deletedRecords.isEmpty else { return }
 
@@ -311,7 +337,11 @@ final class MedicationStore: ObservableObject {
                 continue
             }
 
-            medications[medicationIndex].tabletsRemaining += max(1, record.tabletCount)
+            if returningTablets {
+                let restored = medications[medicationIndex].tabletsRemaining + max(1, record.tabletCount)
+                medications[medicationIndex].tabletsRemaining = MedicationQuantityLimits.tabletCount.clamping(restored)
+            }
+
             medications[medicationIndex].lastTakenAt = latestDoseDate(
                 forMedicationID: record.medicationID,
                 excluding: recordIDs
@@ -323,7 +353,10 @@ final class MedicationStore: ObservableObject {
 
     func refill(_ medication: Medication, to count: Int) {
         guard let index = medications.firstIndex(where: { $0.id == medication.id }) else { return }
-        medications[index].tabletsRemaining = MedicationQuantityLimits.tabletCount.clamping(count)
+        let clamped = MedicationQuantityLimits.tabletCount.clamping(count)
+        medications[index].tabletsRemaining = clamped
+        // A bigger bottle than we have ever seen becomes the new full mark.
+        medications[index].bottleCapacity = max(medications[index].bottleCapacity, clamped)
     }
 
     private func latestDoseDate(forMedicationID medicationID: Medication.ID, excluding recordIDs: Set<DoseRecord.ID>) -> Date? {

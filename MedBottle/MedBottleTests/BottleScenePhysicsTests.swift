@@ -148,7 +148,7 @@ final class BottleScenePhysicsTests: XCTestCase {
         }
 
         let pills = tabletGroup.childNodes.filter { $0.name == Contract.pillName }
-        guard pills.count == min(inventory, 18) else {
+        guard pills.count == expectedPillCount(inventory: inventory) else {
             XCTFail("Active pill count changed to \(pills.count): \(context)")
             return false
         }
@@ -209,6 +209,17 @@ final class BottleScenePhysicsTests: XCTestCase {
         return tabletGroup.childNodes.filter { $0.name == Contract.pillName }
     }
 
+    /// Pinned so `inventory` maps 1:1 onto spawned bodies under `BottleFillPolicy`,
+    /// keeping this stress matrix about containment rather than about fill ratios.
+    private static let physicsTestCapacity = BottleFillPolicy.maxVisiblePillCount
+
+    private func expectedPillCount(inventory: Int) -> Int {
+        BottleFillPolicy.visiblePillCount(
+            tabletsRemaining: inventory,
+            bottleCapacity: Self.physicsTestCapacity
+        )
+    }
+
     private func makeScene(shape: MedicationShape, inventory: Int) -> SCNScene {
         BottleSceneFactory.scene(
             for: Medication(
@@ -217,9 +228,10 @@ final class BottleScenePhysicsTests: XCTestCase {
                 tabletsRemaining: inventory,
                 tabletsPerDose: 1,
                 bottleColorHex: "D68A28",
-                medicationShape: shape,
-                lastTakenAt: nil
+                lastTakenAt: nil,
+                bottleCapacity: Self.physicsTestCapacity
             ),
+            shape: shape,
             colorScheme: .light,
             reduceMotion: false
         )

@@ -8,7 +8,6 @@ final class PersistentMedication {
     var tabletsRemaining: Int
     var tabletsPerDose: Int
     var bottleColorHex: String
-    var medicationShapeRawValue: String
     var classificationRawValue: String
     var lastTakenAt: Date?
     @Relationship(deleteRule: .cascade) var reminders: [PersistentMedicationReminder]
@@ -19,7 +18,6 @@ final class PersistentMedication {
         tabletsRemaining: Int,
         tabletsPerDose: Int,
         bottleColorHex: String,
-        medicationShape: MedicationShape,
         classification: MedicationClassification,
         reminders: [PersistentMedicationReminder] = [],
         lastTakenAt: Date? = nil
@@ -29,7 +27,6 @@ final class PersistentMedication {
         self.tabletsRemaining = MedicationQuantityLimits.tabletCount.clamping(tabletsRemaining)
         self.tabletsPerDose = MedicationQuantityLimits.doseCount.clamping(tabletsPerDose)
         self.bottleColorHex = bottleColorHex
-        self.medicationShapeRawValue = medicationShape.rawValue
         self.classificationRawValue = classification.rawValue
         self.reminders = reminders
         self.lastTakenAt = lastTakenAt
@@ -191,15 +188,10 @@ extension PersistentMedication {
             tabletsRemaining: medication.tabletsRemaining,
             tabletsPerDose: medication.tabletsPerDose,
             bottleColorHex: medication.bottleColorHex,
-            medicationShape: medication.medicationShape,
             classification: medication.classification,
             reminders: medication.reminders.map(PersistentMedicationReminder.init(reminder:)),
             lastTakenAt: medication.lastTakenAt
         )
-    }
-
-    var medicationShape: MedicationShape {
-        MedicationShape(rawValue: medicationShapeRawValue) ?? .tablet
     }
 
     var classification: MedicationClassification {
@@ -211,7 +203,6 @@ extension PersistentMedication {
         tabletsRemaining = MedicationQuantityLimits.tabletCount.clamping(medication.tabletsRemaining)
         tabletsPerDose = MedicationQuantityLimits.doseCount.clamping(medication.tabletsPerDose)
         bottleColorHex = medication.bottleColorHex
-        medicationShapeRawValue = medication.medicationShape.rawValue
         classificationRawValue = medication.classification.rawValue
         lastTakenAt = medication.lastTakenAt
         reminders = medication.reminders.map(PersistentMedicationReminder.init(reminder:))
@@ -224,7 +215,6 @@ extension PersistentMedication {
             tabletsRemaining: tabletsRemaining,
             tabletsPerDose: tabletsPerDose,
             bottleColorHex: bottleColorHex,
-            medicationShape: medicationShape,
             classification: classification,
             reminders: reminders.map { $0.toReminder() },
             lastTakenAt: lastTakenAt
@@ -297,16 +287,99 @@ struct MedicationHeroContent: Identifiable, Hashable, Sendable {
     var id: Medication.ID
     var name: String
     var classificationText: String
-    var shapeText: String
     var bottleColorHex: String
 }
 
+/// How a single calendar day scored against what was scheduled for it.
+enum MedicationDayAdherence: String, Hashable, Sendable {
+    case complete   // logged >= expected
+    case partial    // 0 < logged < expected
+    case missed     // nothing logged on a past day that expected doses
+    case none       // nothing was expected, or the day has not finished yet
+}
+
+struct MedicationDayStatus: Hashable, Sendable {
+    var expectedDoses: Int
+    var loggedDoses: Int
+    var adherence: MedicationDayAdherence
+
+    /// ", 1 of 2 doses" — appended to the day cell's accessibility label.
+    var accessibilitySuffix: String {
+        guard expectedDoses > 0 else {
+            return loggedDoses > 0 ? ", \(loggedDoses) dose\(loggedDoses == 1 ? "" : "s")" : ""
+        }
+        return ", \(loggedDoses) of \(expectedDoses) doses"
+    }
+}
+
+/// Answers "did I take it today?" for a single medication.
+enum MedicationDoseVerdict: String, Hashable, Sendable {
+    case takenToday      // a dose was logged today
+    case dueNow          // scheduled time has passed today, nothing logged
+    case upcoming        // scheduled later today, nothing logged yet
+    case noSchedule      // as-needed or no active reminder
+}
+
+struct MedicationTodayStatus: Hashable, Sendable {
+    var verdict: MedicationDoseVerdict
+    var title: String        // "Taken today"
+    var detail: String       // "14 doses · latest 2:30 PM"
+    var systemImage: String
+    /// What is coming, not what happened: "Next tomorrow 8:30 AM · 1 tablet". This card
+    /// is the only place the schedule appears, so it has to answer both questions.
+    var scheduleDetail: String = ""
+
+    var accessibilityLabel: String {
+        scheduleDetail.isEmpty ? "\(title). \(detail)" : "\(title). \(detail). \(scheduleDetail)"
+    }
+}
+
 struct MedicationStockStatus: Hashable, Sendable {
+    /// Days of supply at which a bottle counts as low. The reorder prompt and the low
+    /// state are the same threshold, so they cannot drift apart.
+    static let refillLeadDays = 7
+
     var level: MedicationStockLevel
     var title: String
     var message: String
     var remainingCount: Int
     var remainingDoses: Int
+    /// Whole days of supply left. `nil` when nothing is scheduled.
+    var daysRemaining: Int?
+    /// Day the bottle empties. `nil` when nothing is scheduled.
+    var runsOutDate: Date?
+    /// "18 days left" | "30 tablets left"
+    var supplyHeadline: String
+    /// "Runs out Aug 24" | "No schedule set"
+    var supplyDetail: String
+    /// Day to order by to land the refill before the bottle empties. `nil` when nothing
+    /// is scheduled, or when that day has already passed — then the card is urgent, not
+    /// forward-looking.
+    var reorderByDate: Date?
+
+    init(
+        level: MedicationStockLevel,
+        title: String,
+        message: String,
+        remainingCount: Int,
+        remainingDoses: Int,
+        daysRemaining: Int? = nil,
+        runsOutDate: Date? = nil,
+        supplyHeadline: String = "",
+        supplyDetail: String = "",
+        reorderByDate: Date? = nil
+    ) {
+        self.level = level
+        self.title = title
+        self.message = message
+        self.remainingCount = remainingCount
+        self.remainingDoses = remainingDoses
+        self.daysRemaining = daysRemaining
+        self.runsOutDate = runsOutDate
+        self.supplyHeadline = supplyHeadline
+        self.supplyDetail = supplyDetail
+        self.reorderByDate = reorderByDate
+    }
 }
 
 struct MedicationDetailMetric: Identifiable, Hashable, Sendable {
@@ -338,7 +411,25 @@ struct MedicationReminderOverview: Hashable, Sendable {
     var subtitle: String
     var activeCount: Int
     var nextReminderText: String?
+    /// Next scheduled occurrence. Formatting belongs to the view.
+    var nextReminderDate: Date?
     var reminders: [MedicationReminderSummary]
+
+    init(
+        title: String,
+        subtitle: String,
+        activeCount: Int,
+        nextReminderText: String? = nil,
+        nextReminderDate: Date? = nil,
+        reminders: [MedicationReminderSummary]
+    ) {
+        self.title = title
+        self.subtitle = subtitle
+        self.activeCount = activeCount
+        self.nextReminderText = nextReminderText
+        self.nextReminderDate = nextReminderDate
+        self.reminders = reminders
+    }
 }
 
 struct MedicationDetailActions: Hashable, Sendable {
@@ -349,6 +440,28 @@ struct MedicationDetailActions: Hashable, Sendable {
     var refillTitle: String
     var refillSystemImage: String
     var defaultRefillCount: Int
+    /// Drives the outlined "Log another dose" variant.
+    var isDoseLoggedToday: Bool
+
+    init(
+        canLogDose: Bool,
+        canRefill: Bool,
+        primaryTitle: String,
+        primarySystemImage: String,
+        refillTitle: String,
+        refillSystemImage: String,
+        defaultRefillCount: Int,
+        isDoseLoggedToday: Bool = false
+    ) {
+        self.canLogDose = canLogDose
+        self.canRefill = canRefill
+        self.primaryTitle = primaryTitle
+        self.primarySystemImage = primarySystemImage
+        self.refillTitle = refillTitle
+        self.refillSystemImage = refillSystemImage
+        self.defaultRefillCount = defaultRefillCount
+        self.isDoseLoggedToday = isDoseLoggedToday
+    }
 }
 
 enum MedicationQuantityInputError: LocalizedError, Equatable, Sendable {
@@ -510,6 +623,7 @@ struct MedicationDetailSnapshot: Identifiable, Equatable, Sendable {
     var id: Medication.ID { medication.id }
     var medication: Medication
     var hero: MedicationHeroContent
+    var todayStatus: MedicationTodayStatus
     var stockStatus: MedicationStockStatus
     var metrics: [MedicationDetailMetric]
     var reminderOverview: MedicationReminderOverview
